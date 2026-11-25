@@ -1,0 +1,5401 @@
+Toggles = Toggles or {}
+Options = Options or {}
+
+local function installSafeDrawingWrapper()
+    if type(Drawing) ~= 'table' or type(Drawing.new) ~= 'function' then
+        return
+    end
+
+    local wrappedFlag = '__xeno_safe_drawing_new_wrapped'
+    local alreadyWrapped = false
+    pcall(function()
+        if type(getgenv) == 'function' then
+            local env = getgenv()
+            if type(env) == 'table' and env[wrappedFlag] == true then
+                alreadyWrapped = true
+            end
+        end
+    end)
+    if alreadyWrapped then
+        return
+    end
+
+    local originalNew = Drawing.new
+    local noop = function() end
+    local function makeDummyDrawing()
+        return setmetatable({}, {
+            __index = function(_, key)
+                if key == 'Remove' or key == 'Destroy' then
+                    return noop
+                end
+                return nil
+            end,
+            __newindex = function()
+            end
+        })
+    end
+
+    Drawing.new = function(...)
+        local ok, obj = pcall(originalNew, ...)
+        if not ok then
+            return makeDummyDrawing()
+        end
+        if obj == nil or type(obj) == 'number' then
+            return makeDummyDrawing()
+        end
+        return obj
+    end
+
+    pcall(function()
+        if type(getgenv) == 'function' then
+            local env = getgenv()
+            if type(env) == 'table' then
+                env[wrappedFlag] = true
+            end
+        end
+    end)
+end
+
+installSafeDrawingWrapper()
+
+-- Wrap callbacks so runtime errors never surface
+local function safeCallback(fn)
+    return function(...)
+        local args = { ... }
+        local function runner()
+            return fn(table.unpack(args))
+        end
+        -- swallow any error to keep the script silent
+        xpcall(runner, function() end)
+    end
+end
+
+local function safeConnect(signal, fn)
+    if signal == nil or type(signal.Connect) ~= 'function' or type(fn) ~= 'function' then
+        return nil
+    end
+    return signal:Connect(safeCallback(fn))
+end
+
+local function safeSpawn(fn, ...)
+    if type(fn) ~= 'function' then
+        return nil
+    end
+    local args = { ... }
+    local function runner()
+        return fn(table.unpack(args))
+    end
+    if type(task) == 'table' and type(task.spawn) == 'function' then
+        return task.spawn(safeCallback(runner))
+    end
+    local co = coroutine.create(safeCallback(runner))
+    return coroutine.resume(co)
+end
+
+pcall(function()
+    local function mute() end
+    print = mute
+    warn = mute
+end)
+
+-- Minimal helper to create option objects
+local function makeOption(id, default)
+    local obj = { Value = default }
+    function obj:OnChanged(fn)
+        self.__onchange = fn
+    end
+    function obj:SetValue(v)
+        self.Value = v
+        if self.__onchange then
+            pcall(self.__onchange, v)
+        end
+    end
+    function obj:GetState()
+        -- For keypickers that expose a GetState method; default to false
+        return false
+    end
+    return obj
+end
+
+local function makeToggle(id, default)
+    local obj = { Value = default }
+    function obj:OnChanged(fn)
+        self.__onchange = fn
+    end
+    function obj:SetValue(v)
+        self.Value = v
+        if self.__onchange then
+            pcall(self.__onchange, v)
+        end
+    end
+    return obj
+end
+
+-- Minimal UI stub that exposes the small API used in this script
+local Library = {}
+Library.Unloaded = false
+Library.KeybindFrame = { Visible = true }
+
+-- store unload callbacks
+local unloadCallbacks = {}
+function Library:OnUnload(fn)
+    if type(fn) == 'function' then
+        table.insert(unloadCallbacks, fn)
+    end
+end
+function Library:Unload()
+    Library.Unloaded = true
+    for _, cb in ipairs(unloadCallbacks) do
+        pcall(cb)
+    end
+end
+
+-- Create a very small window/tab/groupbox/tabbox system that only records
+-- Toggles and Options and returns objects with the methods the script calls.
+function Library:CreateWindow(opts)
+    local Window = {}
+    function Window:AddTab(name)
+        local Tab = { name = name }
+        function Tab:AddLeftGroupbox(title)
+            local gb = {}
+            function gb:AddToggle(id, cfg)
+                Toggles[id] = makeToggle(id, cfg and cfg.Default)
+                return Toggles[id]
+            end
+            function gb:AddLabel(_) -- returns a small helper for colorpicker/keypicker chaining
+                local cap = {}
+                function cap:AddColorPicker(id, cfg)
+                    Options[id] = makeOption(id, cfg and cfg.Default)
+                    return Options[id]
+                end
+                function cap:AddKeyPicker(id, cfg)
+                    Options[id] = makeOption(id, cfg and cfg.Default)
+                    return Options[id]
+                end
+                return cap
+            end
+            function gb:AddSlider(id, cfg)
+                Options[id] = makeOption(id, cfg and cfg.Default)
+                return Options[id]
+            end
+            function gb:AddDropdown(id, cfg)
+                Options[id] = makeOption(id, cfg and cfg.Default)
+                return Options[id]
+            end
+            function gb:AddButton(name, fn)
+                -- call once to keep semantics similar to original (no-op until pressed)
+                gb[name] = fn
+                return gb
+            end
+            return gb
+        end
+        function Tab:AddRightGroupbox(title)
+            return Tab:AddLeftGroupbox(title)
+        end
+        function Tab:AddRightTabbox()
+            local tabbox = {}
+            function tabbox:AddTab(n)
+                -- Tabbox pages should expose control methods directly (AddToggle/AddSlider/etc).
+                return Tab:AddLeftGroupbox(n)
+            end
+            return tabbox
+        end
+        return Tab
+    end
+    return Window
+end
+
+-- Try to use the real GUI API from gui.lua while keeping the old Add* interface.
+local function isGuiLibrary(lib)
+    return type(lib) == 'table'
+        and type(lib.Window) == 'function'
+        and type(lib.Page) == 'function'
+end
+
+local function enumFromString(raw)
+    if type(raw) ~= 'string' then
+        return nil
+    end
+
+    local keyCodeName = raw:match('^Enum%.KeyCode%.(.+)$')
+    if keyCodeName and Enum.KeyCode[keyCodeName] then
+        return Enum.KeyCode[keyCodeName]
+    end
+
+    local inputTypeName = raw:match('^Enum%.UserInputType%.(.+)$')
+    if inputTypeName and Enum.UserInputType[inputTypeName] then
+        return Enum.UserInputType[inputTypeName]
+    end
+
+    return nil
+end
+
+local function normalizeKeyValue(raw)
+    if typeof and typeof(raw) == 'EnumItem' then
+        return raw
+    end
+
+    local parsed = enumFromString(raw)
+    if parsed then
+        return parsed
+    end
+
+    if type(raw) == 'string' then
+        local candidate = raw
+        if #candidate == 1 then
+            candidate = string.upper(candidate)
+        end
+
+        if Enum.KeyCode[candidate] then
+            return Enum.KeyCode[candidate]
+        end
+        if Enum.UserInputType[candidate] then
+            return Enum.UserInputType[candidate]
+        end
+    end
+
+    return raw
+end
+
+local function multiValueToList(value)
+    local out = {}
+    if type(value) ~= 'table' then
+        return out
+    end
+
+    local hasNumericKey = false
+    for k, _ in pairs(value) do
+        if type(k) == 'number' then
+            hasNumericKey = true
+            break
+        end
+    end
+
+    if hasNumericKey then
+        for _, v in pairs(value) do
+            if type(v) == 'string' then
+                table.insert(out, v)
+            end
+        end
+        return out
+    end
+
+    for k, v in pairs(value) do
+        if v and type(k) == 'string' then
+            table.insert(out, k)
+        end
+    end
+
+    return out
+end
+
+local function multiValueToMap(value)
+    local out = {}
+    if type(value) ~= 'table' then
+        return out
+    end
+
+    for k, v in pairs(value) do
+        if type(v) == 'string' then
+            out[v] = true
+        elseif type(k) == 'string' and v == true then
+            out[k] = true
+        end
+    end
+
+    return out
+end
+
+local function getPlayerNames()
+    local players = game:GetService('Players')
+    local out = {}
+    for _, pl in ipairs(players:GetPlayers()) do
+        if pl ~= players.LocalPlayer then
+            table.insert(out, pl.Name)
+        end
+    end
+    table.sort(out)
+    return out
+end
+
+local function resolveGuiLibrary()
+    local existing = nil
+
+    pcall(function()
+        if type(getgenv) == 'function' then
+            local env = getgenv()
+            if env and isGuiLibrary(env.Library) then
+                existing = env.Library
+            end
+        end
+    end)
+
+    if not existing and isGuiLibrary(_G.Library) then
+        existing = _G.Library
+    end
+
+    if existing then
+        return existing
+    end
+
+    if type(isfile) ~= 'function' or type(readfile) ~= 'function' or type(loadstring) ~= 'function' then
+        return nil
+    end
+
+    local candidates = {
+        'gui.lua',
+        '.\\gui.lua',
+        'C:\\Users\\antihype\\Downloads\\gui.lua',
+        'C:/Users/antihype/Downloads/gui.lua',
+    }
+
+    for _, path in ipairs(candidates) do
+        local ok, result = pcall(function()
+            if not isfile(path) then
+                return nil
+            end
+
+            local source = readfile(path)
+            local marker = source:find('%-%-example here')
+            if marker then
+                source = source:sub(1, marker - 1) .. '\ngetgenv().Library = Library\nreturn Library\n'
+            end
+
+            local chunk = loadstring(source)
+            if not chunk then
+                return nil
+            end
+
+            local loaded = chunk()
+            if isGuiLibrary(loaded) then
+                return loaded
+            end
+
+            if type(getgenv) == 'function' then
+                local env = getgenv()
+                if env and isGuiLibrary(env.Library) then
+                    return env.Library
+                end
+            end
+
+            return nil
+        end)
+
+        if ok and isGuiLibrary(result) then
+            return result
+        end
+    end
+
+    return nil
+end
+
+local GuiLibrary = nil
+if GuiLibrary then
+    local function makeGroupbox(section)
+        local gb = {}
+
+        function gb:AddToggle(id, cfg)
+            cfg = cfg or {}
+            local wrapped = makeToggle(id, cfg.Default == true)
+
+            local native = section:Toggle({
+                Name = cfg.Text or cfg.Name or id,
+                Flag = id,
+                Default = cfg.Default == true,
+                Callback = function(value)
+                    wrapped.Value = value
+                    if wrapped.__onchange then
+                        pcall(wrapped.__onchange, value)
+                    end
+                end
+            })
+
+            function wrapped:SetValue(v)
+                local boolValue = v and true or false
+                if native and type(native.Set) == 'function' then
+                    pcall(function() native:Set(boolValue) end)
+                else
+                    wrapped.Value = boolValue
+                    if wrapped.__onchange then
+                        pcall(wrapped.__onchange, boolValue)
+                    end
+                end
+            end
+
+            Toggles[id] = wrapped
+            return wrapped
+        end
+
+        function gb:AddLabel(labelText)
+            local nativeLabel = section:Label(labelText or '')
+            local cap = {}
+
+            function cap:AddColorPicker(id, cfg)
+                cfg = cfg or {}
+                local defaultColor = cfg.Default or Color3.fromRGB(255, 255, 255)
+                local defaultAlpha = cfg.Alpha or cfg.Transparency or 0
+                local wrapped = makeOption(id, defaultColor)
+                wrapped.Alpha = defaultAlpha
+
+                local native = nativeLabel:Colorpicker({
+                    Name = cfg.Title or cfg.Text or id,
+                    Flag = id,
+                    Default = defaultColor,
+                    Alpha = defaultAlpha,
+                    Callback = function(color, alpha)
+                        wrapped.Value = color
+                        wrapped.Alpha = alpha
+                        if wrapped.__onchange then
+                            pcall(wrapped.__onchange, color)
+                        end
+                    end
+                })
+
+                function wrapped:SetValue(v)
+                    if native and type(native.Set) == 'function' then
+                        pcall(function() native:Set(v, wrapped.Alpha or 0) end)
+                    else
+                        wrapped.Value = v
+                        if wrapped.__onchange then
+                            pcall(wrapped.__onchange, v)
+                        end
+                    end
+                end
+
+                Options[id] = wrapped
+                return wrapped
+            end
+
+            function cap:AddKeyPicker(id, cfg)
+                cfg = cfg or {}
+                local wrapped = makeOption(id, normalizeKeyValue(cfg.Default or Enum.KeyCode.C))
+                wrapped.__state = false
+
+                local function syncFromFlags()
+                    local keyData = GuiLibrary.Flags and GuiLibrary.Flags[id]
+                    if type(keyData) == 'table' then
+                        wrapped.__state = keyData.Toggled and true or false
+                        wrapped.Value = enumFromString(keyData.Key) or keyData.Key or wrapped.Value
+                    end
+                end
+
+                local native = nativeLabel:Keybind({
+                    Name = cfg.Text or labelText or id,
+                    Flag = id,
+                    Default = normalizeKeyValue(cfg.Default or Enum.KeyCode.C),
+                    Mode = cfg.Mode or 'Toggle',
+                    Callback = function()
+                        syncFromFlags()
+                        if wrapped.__onchange then
+                            pcall(wrapped.__onchange, wrapped.Value)
+                        end
+                    end
+                })
+
+                syncFromFlags()
+
+                function wrapped:GetState()
+                    return wrapped.__state == true
+                end
+
+                function wrapped:SetValue(v)
+                    local normalized = normalizeKeyValue(v)
+                    if native and type(native.Set) == 'function' then
+                        pcall(function()
+                            if cfg.Mode then
+                                native:Set({ Key = normalized, Mode = cfg.Mode })
+                            else
+                                native:Set(normalized)
+                            end
+                        end)
+                        syncFromFlags()
+                        if wrapped.__onchange then
+                            pcall(wrapped.__onchange, wrapped.Value)
+                        end
+                    else
+                        wrapped.Value = normalized
+                        wrapped.__state = false
+                        if wrapped.__onchange then
+                            pcall(wrapped.__onchange, wrapped.Value)
+                        end
+                    end
+                end
+
+                Options[id] = wrapped
+                return wrapped
+            end
+
+            return cap
+        end
+
+        function gb:AddSlider(id, cfg)
+            cfg = cfg or {}
+
+            local decimals = cfg.Decimals
+            if type(decimals) ~= 'number' then
+                if type(cfg.Rounding) == 'number' then
+                    if cfg.Rounding <= 0 then
+                        decimals = 1
+                    else
+                        decimals = 1 / (10 ^ cfg.Rounding)
+                    end
+                else
+                    decimals = 1
+                end
+            end
+
+            local wrapped = makeOption(id, cfg.Default or 0)
+            local native = section:Slider({
+                Name = cfg.Text or cfg.Name or id,
+                Flag = id,
+                Default = cfg.Default or 0,
+                Min = cfg.Min or 0,
+                Max = cfg.Max or 100,
+                Decimals = decimals,
+                Suffix = cfg.Suffix or '',
+                Callback = function(value)
+                    wrapped.Value = value
+                    if wrapped.__onchange then
+                        pcall(wrapped.__onchange, value)
+                    end
+                end
+            })
+
+            function wrapped:SetValue(v)
+                if native and type(native.Set) == 'function' then
+                    pcall(function() native:Set(v) end)
+                else
+                    wrapped.Value = v
+                    if wrapped.__onchange then
+                        pcall(wrapped.__onchange, v)
+                    end
+                end
+            end
+
+            Options[id] = wrapped
+            return wrapped
+        end
+
+        function gb:AddDropdown(id, cfg)
+            cfg = cfg or {}
+            local isMulti = cfg.Multi == true
+            local isPlayerList = cfg.SpecialType == 'Player'
+            local items = cfg.Items or cfg.Values or {}
+            if isPlayerList then
+                items = getPlayerNames()
+            end
+
+            local defaultValue = cfg.Default
+            if isMulti then
+                defaultValue = multiValueToList(defaultValue)
+            end
+
+            local wrapped = makeOption(id, isMulti and multiValueToMap(defaultValue) or defaultValue)
+
+            local native = section:Dropdown({
+                Name = cfg.Text or cfg.Name or id,
+                Flag = id,
+                Items = items,
+                Default = defaultValue,
+                Multi = isMulti,
+                Callback = function(value)
+                    local normalized = value
+                    if isMulti then
+                        normalized = multiValueToMap(value)
+                    end
+                    wrapped.Value = normalized
+                    if wrapped.__onchange then
+                        pcall(wrapped.__onchange, normalized)
+                    end
+                end
+            })
+
+            if isPlayerList and native and type(native.Refresh) == 'function' then
+                local players = game:GetService('Players')
+                local function refreshPlayers()
+                    pcall(function()
+                        native:Refresh(getPlayerNames())
+                    end)
+                end
+                pcall(function() safeConnect(players.PlayerAdded, refreshPlayers) end)
+                pcall(function() safeConnect(players.PlayerRemoving, refreshPlayers) end)
+            end
+
+            function wrapped:SetValue(v)
+                local toSet = v
+                if isMulti then
+                    toSet = multiValueToList(v)
+                end
+
+                if native and type(native.Set) == 'function' then
+                    pcall(function() native:Set(toSet) end)
+                else
+                    local normalized = isMulti and multiValueToMap(toSet) or toSet
+                    wrapped.Value = normalized
+                    if wrapped.__onchange then
+                        pcall(wrapped.__onchange, normalized)
+                    end
+                end
+            end
+
+            Options[id] = wrapped
+            return wrapped
+        end
+
+        function gb:AddButton(name, fn)
+            local nativeButton = section:Button()
+            if nativeButton and type(nativeButton.Add) == 'function' then
+                pcall(function()
+                    nativeButton:Add(name, fn or function() end)
+                end)
+            end
+            return gb
+        end
+
+        return gb
+    end
+
+    function Library:CreateWindow(opts)
+        opts = opts or {}
+        local realWindow = GuiLibrary:Window({
+            Logo = opts.Logo or opts.logo or '77218680285262',
+            FadeTime = opts.MenuFadeTime or opts.FadeTime or opts.fadetime or 0.2
+        })
+
+        local window = {}
+        function window:AddTab(name)
+            local page = realWindow:Page({
+                Name = name or 'Tab',
+                Columns = 2
+            })
+
+            local tab = { name = name }
+
+            function tab:AddLeftGroupbox(title)
+                local section = page:Section({ Name = title or 'Left', Side = 1 })
+                return makeGroupbox(section)
+            end
+
+            function tab:AddRightGroupbox(title)
+                local section = page:Section({ Name = title or 'Right', Side = 2 })
+                return makeGroupbox(section)
+            end
+
+            function tab:AddRightTabbox()
+                local tabbox = {}
+                function tabbox:AddTab(tabName)
+                    return tab:AddRightGroupbox(tabName)
+                end
+                return tabbox
+            end
+
+            return tab
+        end
+
+        return window
+    end
+
+    function Library:Unload()
+        if Library.Unloaded then
+            return
+        end
+
+        Library.Unloaded = true
+        pcall(function()
+            if type(GuiLibrary.Unload) == 'function' then
+                GuiLibrary:Unload()
+            end
+        end)
+        for _, cb in ipairs(unloadCallbacks) do
+            pcall(cb)
+        end
+    end
+end
+
+-- Minimal ThemeManager/SaveManager stubs used later in the script
+local ThemeManager = { SetLibrary = function() end, ApplyToTab = function() end, SetFolder = function() end }
+local SaveManager = {
+    SetLibrary = function() end,
+    IgnoreThemeSettings = function() end,
+    SetIgnoreIndexes = function() end,
+    SetFolder = function() end,
+    BuildConfigSection = function() end,
+    LoadAutoloadConfig = function() end
+}
+
+-- Expose Library globally (script expects it as global variable)
+_G.Library = Library
+
+local Window = Library:CreateWindow({
+    -- Set Center to true if you want the menu to appear in the center
+    -- Set AutoShow to true if you want the menu to appear when it is created
+    -- Position and Size are also valid options here
+    -- but you do not need to define them unless you are changing them :)
+
+    Title = 'Bomzhood Hub',
+    Center = true,
+    AutoShow = true,
+    TabPadding = 8,
+    MenuFadeTime = 0.2
+})
+
+-- CALLBACK NOTE:
+-- Passing in callback functions via the initial element parameters (i.e. Callback = function(Value)...) works
+-- HOWEVER, using Toggles/Options.INDEX:OnChanged(function(Value) ... ) is the RECOMMENDED way to do this.
+-- I strongly recommend decoupling UI code from logic code. i.e. Create your UI elements FIRST, and THEN setup :OnChanged functions later.
+
+-- You do not have to set your tabs & groups up this way, just a prefrence.
+local Tabs = {
+    -- Creates a new tab titled Main
+    Main = Window:AddTab('Main'),
+    Visuals = Window:AddTab('Visuals'),
+    ['UI Settings'] = Window:AddTab('UI Settings'),
+}
+
+-- Groupbox and Tabbox inherit the same functions
+-- except Tabboxes you have to call the functions on a tab (Tabbox:AddTab(name))
+local LeftGroupBox = Tabs.Main:AddLeftGroupbox('HitBox')
+-- We can also get our Main tab via the following code:
+-- local LeftGroupBox = Window.Tabs.Main:AddLeftGroupbox('Groupbox')
+
+-- Tabboxes are a tiny bit different, but here's a basic example:
+-- HitBox controls: enable, show, color picker and size slider
+LeftGroupBox:AddToggle('HitboxEnable', {
+    Text = 'Enable Hitboxes',
+    Default = false,
+    Tooltip = 'Enable hitbox expansion for other players'
+})
+
+LeftGroupBox:AddToggle('HitboxShow', {
+    Text = 'Show Hitbox Adornments',
+    Default = true,
+    Tooltip = 'Show visual hitbox outlines'
+})
+
+LeftGroupBox:AddLabel('Hitbox Color'):AddColorPicker('HitboxColor', {
+    Default = Color3.fromRGB(37, 115, 184),
+    Title = 'Hitbox Color',
+    Transparency = 0,
+    Callback = function(Value)
+        -- handled below via Options hook
+    end
+})
+
+LeftGroupBox:AddSlider('HitboxSizeSlider', {
+    Text = 'Hitbox Size (0 = normal)',
+    Default = 0,
+    Min = 0,
+    Max = 50,
+    Rounding = 0,
+    Compact = false,
+    Callback = function(Value)
+        -- handled below via Options hook
+    end
+})
+
+-- Internal state
+local HitboxEnabled = false
+local HitboxShow = true
+local HitboxSize = 0 -- 0 = normal
+local HitboxColor = Color3.fromRGB(37, 115, 184)
+local OrigSizes = {}
+local HitboxWhitelist = {} -- keys are player names to exclude from hitbox changes
+
+-- Helper: check if player is KO'd. Attempts to find BodyEffects under workspace.Players.Name or the character.
+local function IsPlayerKO(pl)
+    local root = nil
+    -- try workspace.Players.Name (some games put character models under workspace.Players)
+    if workspace:FindFirstChild('Players') and workspace.Players:FindFirstChild(pl.Name) then
+        root = workspace.Players:FindFirstChild(pl.Name)
+    end
+
+    -- fallback to character instance
+    if not root and pl.Character then
+        root = pl.Character
+    end
+
+    if not root then return false end
+
+    local be = root:FindFirstChild('BodyEffects')
+    if not be then return false end
+
+    local ko = be:FindFirstChild('K.O') or be:FindFirstChild('K.O.')
+    if ko and ko:IsA('BoolValue') then
+        return ko.Value
+    end
+
+    return false
+end
+
+-- Wire up UI -> state
+Toggles.HitboxEnable:OnChanged(function()
+    HitboxEnabled = Toggles.HitboxEnable.Value
+    if not HitboxEnabled then
+        -- clean up any adornments and restore sizes
+        for _, pl in ipairs(game:GetService('Players'):GetPlayers()) do
+            if pl.Character then
+                local hrp = pl.Character:FindFirstChild('HumanoidRootPart')
+                if hrp then
+                    local o = hrp:FindFirstChild('HitboxOutline')
+                    if o then pcall(function() o:Destroy() end) end
+                    local s = hrp:FindFirstChild('ForcefieldEffect')
+                    if s then pcall(function() s:Destroy() end) end
+                    if OrigSizes[pl.UserId] then
+                        pcall(function() hrp.Size = OrigSizes[pl.UserId] end)
+                        OrigSizes[pl.UserId] = nil
+                    end
+                end
+            end
+        end
+    end
+end)
+
+Toggles.HitboxShow:OnChanged(function()
+    HitboxShow = Toggles.HitboxShow.Value
+end)
+
+Options.HitboxColor:OnChanged(function()
+    HitboxColor = Options.HitboxColor.Value
+end)
+
+Options.HitboxSizeSlider:OnChanged(function()
+    HitboxSize = Options.HitboxSizeSlider.Value
+end)
+
+-- Whitelist dropdown (multi-select players)
+LeftGroupBox:AddDropdown('HitboxWhitelist', {
+    SpecialType = 'Player',
+    Text = 'Whitelist Players',
+    Tooltip = 'Players excluded from hitbox changes',
+    Multi = true,
+    Default = {},
+    Callback = function() end,
+})
+
+Options.HitboxWhitelist:OnChanged(function()
+    -- rebuild local whitelist table keyed by player name
+    HitboxWhitelist = {}
+    local val = Options.HitboxWhitelist.Value
+    if type(val) == 'table' then
+        for k, v in next, val do
+            if v then
+                HitboxWhitelist[k] = true
+            end
+        end
+    end
+end)
+
+-- Ensure slider starts at 0
+Options.HitboxSizeSlider:SetValue(0)
+
+-- Main worker loop
+safeSpawn(function()
+    local Players = game:GetService('Players')
+    while true do
+        if Library.Unloaded then break end
+
+        if HitboxEnabled then
+            for _, pl in ipairs(Players:GetPlayers()) do
+                pcall(function()
+                    local localPlayer = Players.LocalPlayer
+                    if pl == localPlayer then return end
+                    if HitboxWhitelist[pl.Name] then return end
+                    if not pl.Character then return end
+
+                    local hrp = pl.Character:FindFirstChild('HumanoidRootPart')
+                    local hum = pl.Character:FindFirstChildOfClass('Humanoid')
+                    if not hrp or not hum then return end
+
+                    local isKO = IsPlayerKO(pl)
+
+                    if isKO then
+                        -- force minimal hitbox while KO'd
+                        if not OrigSizes[pl.UserId] then OrigSizes[pl.UserId] = hrp.Size end
+                        hrp.CanCollide = false
+                        hrp.Size = Vector3.new(0.1, 0.1, 0.1)
+                    else
+                        if HitboxSize > 0 then
+                            if not OrigSizes[pl.UserId] then OrigSizes[pl.UserId] = hrp.Size end
+                            hrp.CanCollide = false
+                            hrp.Size = Vector3.new(HitboxSize, HitboxSize, HitboxSize)
+                        else
+                            if OrigSizes[pl.UserId] then
+                                hrp.Size = OrigSizes[pl.UserId]
+                                OrigSizes[pl.UserId] = nil
+                            end
+                        end
+                    end
+
+                    local outline = hrp:FindFirstChild('HitboxOutline')
+                    local sel = hrp:FindFirstChild('ForcefieldEffect')
+
+                    if (not isKO) and HitboxShow and HitboxSize > 0 then
+                        if not outline then
+                            local box = Instance.new('BoxHandleAdornment')
+                            box.Name = 'HitboxOutline'
+                            box.Adornee = hrp
+                            box.Size = Vector3.new(HitboxSize, HitboxSize, HitboxSize)
+                            box.Color3 = HitboxColor
+                            box.Transparency = 0.9
+                            box.AlwaysOnTop = false
+                            box.ZIndex = 0
+                            box.Parent = hrp
+                        else
+                            outline.Size = Vector3.new(HitboxSize, HitboxSize, HitboxSize)
+                            outline.Color3 = HitboxColor
+                        end
+
+                        if not sel then
+                            local selection = Instance.new('SelectionBox')
+                            selection.Name = 'ForcefieldEffect'
+                            selection.Adornee = hrp
+                            selection.LineThickness = 0.02
+                            selection.Color3 = HitboxColor
+                            selection.Transparency = 0.3
+                            selection.Parent = hrp
+                        else
+                            sel.Color3 = HitboxColor
+                        end
+                    else
+                        if outline then pcall(function() outline:Destroy() end) end
+                        if sel then pcall(function() sel:Destroy() end) end
+                    end
+                end)
+            end
+        else
+            for _, pl in ipairs(Players:GetPlayers()) do
+                pcall(function()
+                    if HitboxWhitelist[pl.Name] then return end
+                    if not pl.Character then return end
+                    local hrp = pl.Character:FindFirstChild('HumanoidRootPart')
+                    if not hrp then return end
+                    local outline = hrp:FindFirstChild('HitboxOutline')
+                    if outline then pcall(function() outline:Destroy() end) end
+                    local sel = hrp:FindFirstChild('ForcefieldEffect')
+                    if sel then pcall(function() sel:Destroy() end) end
+                    if OrigSizes[pl.UserId] then
+                        pcall(function() hrp.Size = OrigSizes[pl.UserId] end)
+                        OrigSizes[pl.UserId] = nil
+                    end
+                end)
+            end
+        end
+
+        task.wait(0.7)
+    end
+end)
+
+-- Long text label to demonstrate UI scrolling behaviour.
+local TripleGroup = Tabs.Main:AddLeftGroupbox('Weapon Helpers')
+
+-- Auto Rev: when enabled, holding LMB while holding [Revolver] spams very fast clicks
+TripleGroup:AddToggle('AutoRev', { Text = 'Auto Rev', Default = false })
+
+-- Auto Rev: very fast click spam while holding revolver + LMB
+do
+    local Players = game:GetService('Players')
+    local LocalPlayer = Players.LocalPlayer
+
+    local UIS = game:GetService('UserInputService')
+    local VirtualUser = game:GetService('VirtualUser')
+
+    -- Auto Rev state
+    local AutoRevEnabled = false
+    local revHold = false
+    local revBeginConn, revEndConn
+
+    local function revSpamLoop()
+        -- very fast spam loop while revHold true and revolver is equipped
+        local usedCapture = false
+        while revHold do
+            local ok, curTool = pcall(function()
+                if LocalPlayer and LocalPlayer.Character then
+                    return LocalPlayer.Character:FindFirstChildOfClass('Tool')
+                end
+                return nil
+            end)
+            if not ok or not curTool then break end
+            if curTool.Name ~= '[Revolver]' then break end
+
+            -- Prefer tool:Activate if available (less intrusive)
+            local activated = false
+            pcall(function()
+                if curTool and type(curTool.Activate) == 'function' then
+                    curTool:Activate()
+                    activated = true
+                end
+            end)
+
+            if not activated then
+                -- fallback to VirtualUser; capture controller once per loop session
+                if not usedCapture then
+                    pcall(function() VirtualUser:CaptureController() end)
+                    usedCapture = true
+                end
+                pcall(function()
+                    VirtualUser:Button1Down()
+                    task.wait(0.006)
+                    VirtualUser:Button1Up()
+                end)
+            end
+
+            -- tiny delay between repeats (adjust for speed)
+            task.wait(0.03)
+        end
+    end
+    -- Auto Rev toggle handling
+    if Toggles and Toggles.AutoRev then
+        Toggles.AutoRev:OnChanged(function()
+            AutoRevEnabled = Toggles.AutoRev.Value
+            if AutoRevEnabled then
+                -- connect input listeners if not present
+                if not revBeginConn then
+revBeginConn = safeConnect(UIS.InputBegan, function(input, gameProcessed)
+                        if gameProcessed then return end
+                        if input.UserInputType ~= Enum.UserInputType.MouseButton1 then return end
+                        -- only react when AutoRev enabled and revolver equipped
+                        if not AutoRevEnabled then return end
+                        local cur = LocalPlayer and LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass('Tool')
+                        if not cur or cur.Name ~= '[Revolver]' then return end
+                        -- start spam
+                        if revHold then return end
+                        revHold = true
+                        safeSpawn(revSpamLoop)
+                    end)
+                end
+
+                if not revEndConn then
+revEndConn = safeConnect(UIS.InputEnded, function(input, gameProcessed)
+                        if gameProcessed then return end
+                        if input.UserInputType ~= Enum.UserInputType.MouseButton1 then return end
+                        revHold = false
+                    end)
+                end
+            else
+                -- disconnect listeners
+                if revBeginConn then pcall(function() revBeginConn:Disconnect() end) revBeginConn = nil end
+                if revEndConn then pcall(function() revEndConn:Disconnect() end) revEndConn = nil end
+                revHold = false
+            end
+        end)
+    end
+
+    Library:OnUnload(function()
+        if revBeginConn then pcall(function() revBeginConn:Disconnect() end) revBeginConn = nil end
+        if revEndConn then pcall(function() revEndConn:Disconnect() end) revEndConn = nil end
+        revHold = false
+        AutoRevEnabled = false
+    end)
+end
+
+local TabBox = Tabs.Main:AddRightTabbox() -- Add Tabbox on right side
+
+-- Trigger Bot tab (replaces previous Tab 1/Tab 2)
+local Tab1 = TabBox:AddTab('Trigger Bot')
+Tab1:AddToggle('TriggerEnabled', { Text = 'Enable Trigger Bot', Default = false })
+-- Key picker with built-in Mode support (Hold/Toggle/Always). We also expose a small dropdown
+-- for backwards compatibility and easy access in case some runtimes don't expose the popup.
+Tab1:AddLabel('Trigger Key'):AddKeyPicker('TriggerKey', { Default = 'C', NoUI = false, Text = 'Trigger Key', Mode = 'Hold' })
+Tab1:AddSlider('TriggerDelay', { Text = 'Delay (ms)', Default = 0, Min = 0, Max = 500, Rounding = 0, Compact = false })
+Tab1:AddToggle('TriggerThroughWalls', { Text = 'Through Walls', Default = false })
+
+-- Trigger whitelist (same UI pattern as Hitbox whitelist)
+Tab1:AddDropdown('TriggerWhitelist', { SpecialType = 'Player', Text = 'Whitelist Players', Tooltip = 'Players excluded from trigger', Multi = true, Default = {}, Callback = function() end })
+
+-- We rely solely on the KeyPicker's own mode (selected via the small popup) and read
+-- its stored value per-frame; no separate dropdown is required.
+
+local Tab2 = TabBox:AddTab('Auto-Shot')
+Tab2:AddToggle('AutoShotEnabled', { Text = 'Enable Auto-Shot', Default = true })
+Tab2:AddLabel('Auto-Shot Key'):AddKeyPicker('AutoShotKey', { Default = 'X', NoUI = false, Text = 'Auto-Shot Key', Mode = 'Hold' })
+Tab2:AddToggle('AutoShotQuickSelectEnabled', { Text = 'Auto-Shot Quick Select (LeftAlt)', Default = true })
+Tab2:AddDropdown('AutoShotMode', {
+    Text = 'Auto-Shot Mode',
+    Values = { 'SINGLE', 'BURST' },
+    Default = 'BURST',
+    Multi = false,
+    Callback = function() end
+})
+Tab2:AddDropdown('AutoShotTargetPlayer', {
+    SpecialType = 'Player',
+    Text = 'Auto-Shot Target',
+    Multi = false,
+    Default = '',
+    Callback = function() end
+})
+Tab2:AddSlider('AutoShotDelayMin', { Text = 'Auto-Shot Min Delay (ms)', Default = 130, Min = 0, Max = 500, Rounding = 0, Compact = false })
+Tab2:AddSlider('AutoShotDelayMax', { Text = 'Auto-Shot Max Delay (ms)', Default = 200, Min = 0, Max = 500, Rounding = 0, Compact = false })
+
+-- Trigger Bot implementation
+do
+    -- Triggerbot wired to UI keybind (Options.TriggerKey) and Trigger toggle
+    local Players = game:GetService('Players')
+    local RunService = game:GetService('RunService')
+    local UIS = game:GetService('UserInputService')
+    local LocalPlayer = Players.LocalPlayer
+    local mouse = LocalPlayer and LocalPlayer:GetMouse()
+    local isTriggerMouseDown = false
+    local nextAllowedShotAt = 0
+    local lastWeaponName = nil
+    local REVOLVER_MAX_RANGE = 165
+    local DB_MAX_RANGE = 80
+    local TriggerWhitelist = {}
+
+    local function forceReleaseTriggerMouse()
+        if isTriggerMouseDown then
+            pcall(function() mouse1release() end)
+        end
+        isTriggerMouseDown = false
+    end
+
+    local function stopTriggerFire()
+        forceReleaseTriggerMouse()
+        nextAllowedShotAt = 0
+    end
+
+    local function getShotIntervalForTool(toolName, userDelaySec)
+        return 0
+    end
+
+    local function tryTriggerShot(currentToolName)
+        local delayMs = 0
+        pcall(function()
+            delayMs = tonumber(Options and Options.TriggerDelay and Options.TriggerDelay.Value) or 0
+        end)
+        local userDelaySec = math.max(delayMs, 0) / 1000
+        local interval = getShotIntervalForTool(currentToolName, userDelaySec)
+        local now = os.clock()
+
+        if lastWeaponName ~= currentToolName then
+            lastWeaponName = currentToolName
+            nextAllowedShotAt = 0
+            forceReleaseTriggerMouse()
+        end
+
+        if now < nextAllowedShotAt then
+            return
+        end
+
+        pcall(function() mouse1press() end)
+        isTriggerMouseDown = true
+        task.delay(0.01, function()
+            forceReleaseTriggerMouse()
+        end)
+        nextAllowedShotAt = now + interval
+    end
+
+    -- Robustly rebuild TriggerWhitelist from the UI dropdown value.
+    -- The dropdown may return several shapes depending on runtime: { name = true },
+    -- array-style { [1] = 'name' }, numeric keys, or userId numbers. Handle common cases.
+    local function rebuildTriggerWhitelist()
+        TriggerWhitelist = {}
+        pcall(function()
+            if not (Options and Options.TriggerWhitelist) then return end
+            local val = Options.TriggerWhitelist.Value
+            if type(val) ~= 'table' then return end
+            for k, v in next, val do
+                local candidateName = nil
+
+                -- common case: key = playerName, value = true
+                if type(k) == 'string' and v == true then
+                    candidateName = k
+                end
+
+                -- array-style: value is the playerName string
+                if not candidateName and type(v) == 'string' then
+                    candidateName = v
+                end
+
+                -- numeric key or value might be a userId
+                if not candidateName then
+                    if type(k) == 'number' then
+                        local p = Players:GetPlayerByUserId(k)
+                        if p then candidateName = p.Name end
+                    elseif type(v) == 'number' then
+                        local p = Players:GetPlayerByUserId(v)
+                        if p then candidateName = p.Name end
+                    elseif type(k) == 'string' then
+                        local num = tonumber(k)
+                        if num then
+                            local p = Players:GetPlayerByUserId(num)
+                            if p then candidateName = p.Name end
+                        end
+                    end
+                end
+
+                -- Player object cases (some libs may pass object refs)
+                if not candidateName and type(k) == 'userdata' and typeof(k) == 'Instance' and k.IsA and k:IsA('Player') then
+                    candidateName = k.Name
+                end
+                if not candidateName and type(v) == 'userdata' and typeof(v) == 'Instance' and v.IsA and v:IsA('Player') then
+                    candidateName = v.Name
+                end
+
+                if candidateName then
+                    TriggerWhitelist[candidateName] = true
+                end
+            end
+        end)
+    end
+
+    -- Wire OnChanged to rebuild and do an initial build
+    if Options and Options.TriggerWhitelist and type(Options.TriggerWhitelist.OnChanged) == 'function' then
+        pcall(function() Options.TriggerWhitelist:OnChanged(rebuildTriggerWhitelist) end)
+    end
+    rebuildTriggerWhitelist()
+
+    -- We'll respect the UI toggle (Toggles.TriggerEnabled) and the KeyPicker stored in Options.TriggerKey
+safeConnect(RunService.RenderStepped, function()
+        if Library.Unloaded then
+            stopTriggerFire()
+            return
+        end
+        if not LocalPlayer or not mouse then
+            stopTriggerFire()
+            return
+        end
+
+        -- read toggle state defensively
+        local okToggle, trigEnabled = pcall(function() return (Toggles and Toggles.TriggerEnabled and Toggles.TriggerEnabled.Value) or false end)
+        if not okToggle or not trigEnabled then
+            stopTriggerFire()
+            return
+        end
+
+        -- determine key state from KeyPicker (supports Hold/Toggle/Always modes)
+        local keyActive = false
+        pcall(function()
+            local mode = 'Hold'
+            local keyValue = nil
+            local okv, v = pcall(function() return (Options and Options.TriggerKey and Options.TriggerKey.Value) end)
+            if okv then
+                keyValue = v
+            end
+
+            if keyValue then
+                if type(keyValue) == 'table' and keyValue[2] then
+                    mode = tostring(keyValue[2])
+                elseif type(keyValue) == 'table' and keyValue.Mode then
+                    mode = tostring(keyValue.Mode)
+                end
+            end
+
+            if mode == 'Always' then
+                keyActive = true
+                return
+            end
+
+            if Options and Options.TriggerKey and type(Options.TriggerKey.GetState) == 'function' then
+                local ok2, st = pcall(function() return Options.TriggerKey:GetState() end)
+                if ok2 and st then
+                    keyActive = true
+                    return
+                end
+            end
+
+            local function isPressed(raw)
+                if typeof(raw) == 'EnumItem' then
+                    if raw.EnumType == Enum.KeyCode then
+                        local okDown, isDown = pcall(function() return UIS:IsKeyDown(raw) end)
+                        return okDown and isDown
+                    end
+                    if raw.EnumType == Enum.UserInputType then
+                        local okMouse, isDown = pcall(function() return UIS:IsMouseButtonPressed(raw) end)
+                        return okMouse and isDown
+                    end
+                    return false
+                end
+
+                if type(raw) == 'string' then
+                    local kc = Enum.KeyCode[raw]
+                    if kc then
+                        local okDown, isDown = pcall(function() return UIS:IsKeyDown(kc) end)
+                        return okDown and isDown
+                    end
+                    local ui = Enum.UserInputType[raw]
+                    if ui then
+                        local okMouse, isDown = pcall(function() return UIS:IsMouseButtonPressed(ui) end)
+                        return okMouse and isDown
+                    end
+                end
+
+                return false
+            end
+
+            local lookup = keyValue
+            if type(keyValue) == 'table' then
+                lookup = keyValue.Key or keyValue[1]
+            end
+
+            if isPressed(lookup) then
+                keyActive = true
+                return
+            end
+
+            -- fallback for commonly used hold behavior with keyboard-only key names
+            if type(lookup) == 'string' and #lookup == 1 then
+                local upper = string.upper(lookup)
+                local keyEnum = Enum.KeyCode[upper]
+                if keyEnum then
+                    local okDown, isDown = pcall(function() return UIS:IsKeyDown(keyEnum) end)
+                    if okDown and isDown then
+                        keyActive = true
+                    end
+                end
+            end
+        end)
+        if not keyActive then
+            stopTriggerFire()
+            return
+        end
+
+        -- skip if local player is holding [Knife]
+        local skipLocalKnife = false
+        pcall(function()
+            if LocalPlayer and LocalPlayer.Character then
+                local curTool = LocalPlayer.Character:FindFirstChildOfClass('Tool')
+                if curTool and curTool.Name == '[Knife]' then
+                    skipLocalKnife = true
+                end
+            end
+        end)
+        if skipLocalKnife then
+            stopTriggerFire()
+            return
+        end
+
+        -- read current mouse target
+        local target = nil
+        pcall(function() target = mouse.Target end)
+        if not target or not target.Parent then
+            stopTriggerFire()
+            return
+        end
+
+        -- find humanoid on the target's parent or its parent
+        local parent = target.Parent
+        local humanoid = parent:FindFirstChildOfClass('Humanoid') or (parent.Parent and parent.Parent:FindFirstChildOfClass('Humanoid'))
+
+        -- attempt to resolve the character/model and player for KO checks
+        local modelInstance = parent:FindFirstAncestorOfClass('Model') or parent
+        local pl = nil
+        pcall(function()
+            if modelInstance then pl = Players:GetPlayerFromCharacter(modelInstance) end
+        end)
+
+        -- skip if the target is our local player or in the trigger whitelist
+        if parent.Name == (LocalPlayer and LocalPlayer.Name) then
+            stopTriggerFire()
+            return
+        end
+        if pl and TriggerWhitelist and TriggerWhitelist[pl.Name] then
+            -- whitelisted player: do not trigger
+            stopTriggerFire()
+            return
+        end
+
+        -- helper: robust KO check that inspects BodyEffects under the model or workspace.Players entry
+        local function modelIsKO(m, targ)
+            if not m then return false end
+            -- quick check: maybe K.O BoolValue is directly on the model
+            local be = nil
+            local directKO = nil
+            pcall(function()
+                directKO = m:FindFirstChild('K.O') or m:FindFirstChild('K.O.')
+            end)
+            if directKO and directKO:IsA('BoolValue') then
+                return directKO.Value
+            end
+            pcall(function()
+                be = m:FindFirstChild('BodyEffects')
+                if not be and m.Parent then
+                    -- maybe BodyEffects attached to parent container
+                    be = m.Parent:FindFirstChild('BodyEffects')
+                end
+            end)
+            
+            -- fallback: check workspace.Players entries that the target may be descendant of
+            if not be then
+                pcall(function()
+                    local playersFolder = workspace:FindFirstChild('Players')
+                    if playersFolder then
+                        for _, entry in ipairs(playersFolder:GetChildren()) do
+                            if targ and targ:IsDescendantOf(entry) then
+                                be = entry:FindFirstChild('BodyEffects')
+                                if be then break end
+                            end
+                            -- also check if the model itself is a descendant
+                            if m and m:IsDescendantOf(entry) then
+                                be = entry:FindFirstChild('BodyEffects')
+                                if be then break end
+                            end
+                        end
+                    end
+                end)
+            end
+            if not be then return false end
+            local ko = be:FindFirstChild('K.O') or be:FindFirstChild('K.O.')
+            if ko and ko:IsA('BoolValue') then
+                return ko.Value
+            end
+            return false
+        end
+
+        -- check humanoid health and KO state (prefer IsPlayerKO when available, fallback to model check)
+        local isKO = false
+        pcall(function()
+            if pl and IsPlayerKO and type(IsPlayerKO) == 'function' then
+                isKO = IsPlayerKO(pl)
+            else
+                isKO = modelIsKO(modelInstance, target)
+            end
+        end)
+
+        -- if KO, skip
+        if isKO then
+            stopTriggerFire()
+            return
+        end
+
+        if humanoid and not isKO and humanoid.Health and humanoid.Health > 0 then
+            -- Hard range gating for requested weapons.
+            local inRangeAllowed = true
+            local currentToolName = nil
+            pcall(function()
+                local curTool = LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass('Tool')
+                if curTool then
+                    local tname = curTool.Name
+                    currentToolName = tname
+                    local maxRange = nil
+                    if tname == '[Revolver]' then
+                        maxRange = REVOLVER_MAX_RANGE
+                    elseif tname == '[Double-Barrel SG]' then
+                        maxRange = DB_MAX_RANGE
+                    end
+
+                    if maxRange then
+                        local root = LocalPlayer.Character and (LocalPlayer.Character:FindFirstChild('HumanoidRootPart') or LocalPlayer.Character.PrimaryPart)
+                        local targPos = nil
+
+                        if target and target:IsA('BasePart') then
+                            targPos = target.Position
+                        elseif modelInstance then
+                            local targetRoot = modelInstance:FindFirstChild('HumanoidRootPart') or modelInstance.PrimaryPart
+                            if targetRoot and targetRoot:IsA('BasePart') then
+                                targPos = targetRoot.Position
+                            end
+                        end
+
+                        if not root or not targPos then
+                            inRangeAllowed = false
+                        elseif (root.Position - targPos).Magnitude > maxRange then
+                            inRangeAllowed = false
+                        end
+                    end
+                end
+            end)
+
+            if not inRangeAllowed then
+                -- release and skip firing when out of range
+                stopTriggerFire()
+                return
+            end
+
+            tryTriggerShot(currentToolName)
+            return
+        end
+
+        stopTriggerFire()
+
+    end)
+
+    Library:OnUnload(function()
+        stopTriggerFire()
+    end)
+end
+
+-- Auto-Shot module from New Text Document.lua (without hitbox/whitelist logic)
+do
+    local Players = game:GetService('Players')
+    local Workspace = game:GetService('Workspace')
+    local RunService = game:GetService('RunService')
+    local UIS = game:GetService('UserInputService')
+    local LocalPlayer = Players.LocalPlayer
+    local VirtualInputManager = nil
+    pcall(function() VirtualInputManager = game:GetService('VirtualInputManager') end)
+
+    local ignoredContainer = Workspace:FindFirstChild('Ignored')
+    local ignoredWatcherConnection = nil
+
+    local isAutoShotRunning = false
+    local autoShotTargetPlayerName = ''
+    local runtimeConnections = {}
+    local processingBulletRays = setmetatable({}, { __mode = 'k' })
+
+    local function trackConnection(conn)
+        if conn then
+            table.insert(runtimeConnections, conn)
+        end
+        return conn
+    end
+
+    local function readToggle(id, fallback)
+        local state = fallback == true
+        pcall(function()
+            if Toggles and Toggles[id] ~= nil then
+                state = Toggles[id].Value == true
+            end
+        end)
+        return state
+    end
+
+    local function readNumber(id, fallback)
+        local value = fallback
+        pcall(function()
+            if Options and Options[id] and tonumber(Options[id].Value) ~= nil then
+                value = tonumber(Options[id].Value)
+            end
+        end)
+        return value
+    end
+
+    local function readString(id, fallback)
+        local value = fallback
+        pcall(function()
+            if Options and Options[id] and type(Options[id].Value) == 'string' then
+                value = Options[id].Value
+            end
+        end)
+        return value
+    end
+
+    local function extractSelectedName(raw)
+        if type(raw) == 'string' then
+            return raw
+        end
+        if type(raw) ~= 'table' then
+            return ''
+        end
+        if type(raw.Value) == 'string' then
+            return raw.Value
+        end
+        if type(raw[1]) == 'string' then
+            return raw[1]
+        end
+        for k, v in pairs(raw) do
+            if type(k) == 'string' and v == true then
+                return k
+            end
+            if type(v) == 'string' then
+                return v
+            end
+        end
+        return ''
+    end
+
+    local function syncAutoShotTargetFromOption()
+        local resolved = ''
+        pcall(function()
+            if Options and Options.AutoShotTargetPlayer then
+                resolved = extractSelectedName(Options.AutoShotTargetPlayer.Value)
+            end
+        end)
+        autoShotTargetPlayerName = type(resolved) == 'string' and resolved or ''
+    end
+
+    local function setAutoShotTarget(name)
+        local targetName = type(name) == 'string' and name or ''
+        if autoShotTargetPlayerName == targetName then
+            return
+        end
+
+        autoShotTargetPlayerName = targetName
+        pcall(function()
+            if Options and Options.AutoShotTargetPlayer and type(Options.AutoShotTargetPlayer.SetValue) == 'function' then
+                Options.AutoShotTargetPlayer:SetValue(targetName)
+            end
+        end)
+    end
+
+    local function isAutoShotKeyActive()
+        local isActive = false
+        pcall(function()
+            if not (Options and Options.AutoShotKey) then
+                return
+            end
+
+            if type(Options.AutoShotKey.GetState) == 'function' then
+                local okState, state = pcall(function()
+                    return Options.AutoShotKey:GetState()
+                end)
+                if okState and state then
+                    isActive = true
+                    return
+                end
+            end
+
+            local keyValue = Options.AutoShotKey.Value
+            if type(keyValue) == 'table' then
+                local mode = keyValue.Mode or keyValue[2]
+                if type(mode) == 'string' and string.lower(mode) == 'always' then
+                    isActive = true
+                    return
+                end
+            end
+            local lookup = keyValue
+            if type(keyValue) == 'table' then
+                lookup = keyValue.Key or keyValue[1]
+            end
+
+            local function isPressed(raw)
+                if typeof(raw) == 'EnumItem' then
+                    if raw.EnumType == Enum.KeyCode then
+                        local okDown, down = pcall(function() return UIS:IsKeyDown(raw) end)
+                        return okDown and down
+                    end
+                    if raw.EnumType == Enum.UserInputType then
+                        local okMouse, down = pcall(function() return UIS:IsMouseButtonPressed(raw) end)
+                        return okMouse and down
+                    end
+                    return false
+                end
+
+                if type(raw) == 'string' then
+                    local keyCodeName = raw:match('^Enum%.KeyCode%.(.+)$')
+                    local inputTypeName = raw:match('^Enum%.UserInputType%.(.+)$')
+                    local keyName = keyCodeName or raw
+                    if type(keyName) == 'string' and #keyName == 1 then
+                        keyName = string.upper(keyName)
+                    end
+                    local keyCode = Enum.KeyCode[keyName]
+                    if keyCode then
+                        local okDown, down = pcall(function() return UIS:IsKeyDown(keyCode) end)
+                        return okDown and down
+                    end
+                    local inputType = Enum.UserInputType[inputTypeName or raw]
+                    if inputType then
+                        local okMouse, down = pcall(function() return UIS:IsMouseButtonPressed(inputType) end)
+                        return okMouse and down
+                    end
+                end
+
+                return false
+            end
+
+            isActive = isPressed(lookup)
+        end)
+        return isActive
+    end
+
+    local function pickTargetUnderCursor()
+        if not readToggle('AutoShotQuickSelectEnabled', true) then
+            return false
+        end
+        if not LocalPlayer then
+            return false
+        end
+
+        local mouse = LocalPlayer:GetMouse()
+        if not mouse then
+            return false
+        end
+
+        local target = nil
+        pcall(function()
+            target = mouse.Target
+        end)
+        if not target then
+            return false
+        end
+
+        local model = target:FindFirstAncestorOfClass('Model')
+        if not model then
+            return false
+        end
+
+        local player = Players:GetPlayerFromCharacter(model)
+        if player and player ~= LocalPlayer then
+            setAutoShotTarget(player.Name)
+            return true
+        end
+
+        return false
+    end
+
+    local function performMouseClick(holdTime)
+        if type(mouse1click) == 'function' then
+            pcall(function()
+                mouse1click()
+            end)
+            return
+        end
+
+        if type(mouse1press) == 'function' and type(mouse1release) == 'function' then
+            pcall(function()
+                mouse1press()
+                if holdTime and holdTime > 0 then
+                    task.wait(holdTime)
+                end
+                mouse1release()
+            end)
+            return
+        end
+
+        if VirtualInputManager and type(VirtualInputManager.SendMouseButtonEvent) == 'function' then
+            pcall(function()
+                VirtualInputManager:SendMouseButtonEvent(0, 0, 0, true, game, 0)
+                if holdTime and holdTime > 0 then
+                    task.wait(holdTime)
+                end
+                VirtualInputManager:SendMouseButtonEvent(0, 0, 0, false, game, 0)
+            end)
+        end
+    end
+
+    local function heartbeatWait(seconds)
+        if not seconds or seconds <= 0 then
+            return
+        end
+        local deadline = os.clock() + seconds
+        while os.clock() < deadline do
+            RunService.Heartbeat:Wait()
+        end
+    end
+
+    local function handleAutoShot()
+        syncAutoShotTargetFromOption()
+        if autoShotTargetPlayerName == '' then
+            return
+        end
+        if isAutoShotRunning then
+            return
+        end
+        if not readToggle('AutoShotEnabled', true) then
+            return
+        end
+        if not isAutoShotKeyActive() then
+            return
+        end
+
+        isAutoShotRunning = true
+        task.spawn(function()
+            local minDelayMs = math.max(0, readNumber('AutoShotDelayMin', 130))
+            local maxDelayMs = math.max(0, readNumber('AutoShotDelayMax', 200))
+            if maxDelayMs < minDelayMs then
+                minDelayMs, maxDelayMs = maxDelayMs, minDelayMs
+            end
+
+            local delayMs = minDelayMs
+            if maxDelayMs > minDelayMs then
+                delayMs = minDelayMs + math.random() * (maxDelayMs - minDelayMs)
+            end
+            if delayMs > 0 then
+                heartbeatWait(delayMs / 1000)
+            end
+
+            if Library.Unloaded then
+                isAutoShotRunning = false
+                return
+            end
+            if not readToggle('AutoShotEnabled', true) then
+                isAutoShotRunning = false
+                return
+            end
+            if autoShotTargetPlayerName == '' then
+                isAutoShotRunning = false
+                return
+            end
+            if not isAutoShotKeyActive() then
+                isAutoShotRunning = false
+                return
+            end
+
+            local mode = string.upper(readString('AutoShotMode', 'BURST'))
+            if mode == 'SINGLE' then
+                performMouseClick(0.01)
+            else
+                while true do
+                    if Library.Unloaded then
+                        break
+                    end
+                    if not readToggle('AutoShotEnabled', true) then
+                        break
+                    end
+                    if autoShotTargetPlayerName == '' then
+                        break
+                    end
+                    if string.upper(readString('AutoShotMode', 'BURST')) ~= 'BURST' then
+                        break
+                    end
+                    if not isAutoShotKeyActive() then
+                        break
+                    end
+                    performMouseClick(0.001)
+                    task.wait(0.01)
+                end
+            end
+
+            isAutoShotRunning = false
+        end)
+    end
+
+    if Options and Options.AutoShotTargetPlayer and type(Options.AutoShotTargetPlayer.OnChanged) == 'function' then
+        pcall(function()
+            Options.AutoShotTargetPlayer:OnChanged(function()
+                syncAutoShotTargetFromOption()
+            end)
+        end)
+    end
+    syncAutoShotTargetFromOption()
+
+    trackConnection(safeConnect(UIS.InputBegan, function(input, gameProcessed)
+        if gameProcessed then
+            return
+        end
+        if input.KeyCode == Enum.KeyCode.LeftAlt then
+            pickTargetUnderCursor()
+        end
+    end))
+
+    trackConnection(safeConnect(Players.PlayerRemoving, function(player)
+        if player and player.Name == autoShotTargetPlayerName then
+            setAutoShotTarget('')
+        end
+    end))
+
+    local watchedBulletRays = setmetatable({}, { __mode = 'k' })
+    local queuedBulletRayChecks = setmetatable({}, { __mode = 'k' })
+    local ownerAttributeKeys = { 'OwnerCharachter', 'OwnerCharacter', 'Owner', 'owner' }
+
+    local function normalizeName(value)
+        if value == nil then
+            return ''
+        end
+        if type(value) ~= 'string' then
+            value = tostring(value)
+        end
+
+        local normalized = string.lower(value)
+        normalized = normalized:gsub('^@', '')
+        normalized = normalized:gsub('%s+', '')
+        normalized = normalized:gsub('%.character$', '')
+        normalized = normalized:gsub('_character$', '')
+        normalized = normalized:gsub('%-character$', '')
+        return normalized
+    end
+
+    local function getTargetMatchSet()
+        syncAutoShotTargetFromOption()
+        local set = {}
+        local normalizedTarget = normalizeName(autoShotTargetPlayerName)
+        if normalizedTarget == '' then
+            return set
+        end
+
+        set[normalizedTarget] = true
+        for _, pl in ipairs(Players:GetPlayers()) do
+            if normalizeName(pl.Name) == normalizedTarget or normalizeName(pl.DisplayName) == normalizedTarget then
+                set[normalizeName(pl.Name)] = true
+                set[normalizeName(pl.DisplayName)] = true
+                break
+            end
+        end
+        return set
+    end
+
+    local function isBulletRayInstance(instance)
+        if not instance or typeof(instance) ~= 'Instance' then
+            return false
+        end
+        local upperName = string.upper(instance.Name or '')
+        return upperName == 'BULLET_RAYS' or string.find(upperName, 'BULLET_RAY', 1, true) ~= nil
+    end
+
+    local function ownerValueToName(value)
+        if value == nil then
+            return ''
+        end
+        if type(value) == 'string' then
+            return value
+        end
+        if typeof(value) == 'Instance' then
+            if value:IsA('Player') then
+                return value.Name or ''
+            end
+            if value:IsA('Model') then
+                local ownerPlayer = nil
+                pcall(function()
+                    ownerPlayer = Players:GetPlayerFromCharacter(value)
+                end)
+                if ownerPlayer and ownerPlayer.Name then
+                    return ownerPlayer.Name
+                end
+            end
+            return value.Name or ''
+        end
+        return tostring(value)
+    end
+
+    local function readOwnerCharacter(instance)
+        if not instance or typeof(instance) ~= 'Instance' then
+            return ''
+        end
+
+        local current = instance
+        for _ = 1, 14 do
+            if not current or typeof(current) ~= 'Instance' then
+                break
+            end
+
+            for _, key in ipairs(ownerAttributeKeys) do
+                local value = nil
+                pcall(function()
+                    value = current:GetAttribute(key)
+                end)
+                local ownerName = ownerValueToName(value)
+                if ownerName ~= '' then
+                    return ownerName
+                end
+            end
+
+            if current == ignoredContainer or current == Workspace then
+                break
+            end
+            current = current.Parent
+        end
+
+        return ''
+    end
+
+    local function ownerMatchesTarget(ownerNormalized, targetSet)
+        if ownerNormalized == '' then
+            return false
+        end
+        if targetSet[ownerNormalized] then
+            return true
+        end
+
+        for targetName in pairs(targetSet) do
+            if targetName ~= '' then
+                if string.find(ownerNormalized, targetName, 1, true) ~= nil then
+                    return true
+                end
+                if string.find(targetName, ownerNormalized, 1, true) ~= nil then
+                    return true
+                end
+            end
+        end
+
+        return false
+    end
+
+    local processBulletRay
+
+    local function queueBulletRayCheck(instance)
+        if not instance or typeof(instance) ~= 'Instance' then
+            return
+        end
+        if queuedBulletRayChecks[instance] then
+            return
+        end
+
+        queuedBulletRayChecks[instance] = true
+        task.defer(function()
+            queuedBulletRayChecks[instance] = nil
+            processBulletRay(instance)
+        end)
+    end
+
+    local function watchBulletRay(instance)
+        if not isBulletRayInstance(instance) then
+            return
+        end
+        if watchedBulletRays[instance] then
+            return
+        end
+
+        watchedBulletRays[instance] = true
+        for _, key in ipairs(ownerAttributeKeys) do
+            local signal = nil
+            local okSignal = pcall(function()
+                signal = instance:GetAttributeChangedSignal(key)
+            end)
+            if okSignal and signal then
+                trackConnection(safeConnect(signal, function()
+                    queueBulletRayCheck(instance)
+                end))
+            end
+        end
+
+        trackConnection(safeConnect(instance.AncestryChanged, function(_, parent)
+            if not parent then
+                watchedBulletRays[instance] = nil
+                queuedBulletRayChecks[instance] = nil
+                processingBulletRays[instance] = nil
+            end
+        end))
+
+        queueBulletRayCheck(instance)
+    end
+
+    processBulletRay = function(instance)
+        if not isBulletRayInstance(instance) then
+            return
+        end
+        if Library.Unloaded then
+            return
+        end
+        if not readToggle('AutoShotEnabled', true) then
+            return
+        end
+        if processingBulletRays[instance] then
+            return
+        end
+
+        local targetSet = getTargetMatchSet()
+        if next(targetSet) == nil then
+            return
+        end
+
+        processingBulletRays[instance] = true
+        task.spawn(function()
+            local owner = ''
+            for _ = 1, 60 do
+                owner = readOwnerCharacter(instance)
+                if owner ~= '' then
+                    break
+                end
+                task.wait(0.01)
+            end
+
+            local ownerNormalized = normalizeName(owner)
+            if ownerMatchesTarget(ownerNormalized, targetSet) then
+                handleAutoShot()
+            end
+
+            processingBulletRays[instance] = nil
+        end)
+    end
+
+    local function attachIgnoredWatcher(container)
+        if ignoredWatcherConnection then
+            pcall(function()
+                ignoredWatcherConnection:Disconnect()
+            end)
+            ignoredWatcherConnection = nil
+        end
+
+        ignoredContainer = container
+        if not ignoredContainer or typeof(ignoredContainer) ~= 'Instance' then
+            return
+        end
+
+        ignoredWatcherConnection = trackConnection(safeConnect(ignoredContainer.DescendantAdded, function(desc)
+            watchBulletRay(desc)
+        end))
+
+        pcall(function()
+            if isBulletRayInstance(ignoredContainer) then
+                watchBulletRay(ignoredContainer)
+            end
+            for _, desc in ipairs(ignoredContainer:GetDescendants()) do
+                watchBulletRay(desc)
+            end
+        end)
+    end
+
+    attachIgnoredWatcher(ignoredContainer)
+
+    trackConnection(safeConnect(Workspace.ChildAdded, function(child)
+        if child and child.Name == 'Ignored' then
+            attachIgnoredWatcher(child)
+        end
+    end))
+
+    trackConnection(safeConnect(Workspace.ChildRemoved, function(child)
+        if child and ignoredContainer and child == ignoredContainer then
+            attachIgnoredWatcher(nil)
+        end
+    end))
+
+    local lastIgnoredScan = 0
+    trackConnection(safeConnect(RunService.Heartbeat, function()
+        if not ignoredContainer or Library.Unloaded then
+            return
+        end
+
+        local now = os.clock()
+        if (now - lastIgnoredScan) < 0.05 then
+            return
+        end
+        lastIgnoredScan = now
+
+        pcall(function()
+            for _, desc in ipairs(ignoredContainer:GetDescendants()) do
+                watchBulletRay(desc)
+                if isBulletRayInstance(desc) then
+                    queueBulletRayCheck(desc)
+                end
+            end
+        end)
+    end))
+
+    Library:OnUnload(function()
+        for _, conn in ipairs(runtimeConnections) do
+            pcall(function()
+                conn:Disconnect()
+            end)
+        end
+        runtimeConnections = {}
+        isAutoShotRunning = false
+    end)
+end
+
+-- Insta Macro group: keybind that presses the game's "Get Sturdy 2" control and briefly equips [Knife]
+local RightGroupbox = Tabs.Main:AddRightGroupbox('Insta Macro')
+RightGroupbox:AddLabel('Insta Macro Key'):AddKeyPicker('InstaMacroKey', { Default = 'Insert', NoUI = false, Text = 'Insta Macro' })
+
+-- Bind the keypicker to an action: when pressed, trigger the game's control at
+-- Players.LocalPlayer.DataFolder.Information["Get Sturdy 2"].Value and briefly equip [Knife]
+do
+    local Players = game:GetService('Players')
+    local UIS = game:GetService('UserInputService')
+    local LocalPlayer = Players.LocalPlayer
+
+    -- virtual input manager for simulating key presses (if available)
+    local VirtualInputManager = nil
+    pcall(function() VirtualInputManager = game:GetService('VirtualInputManager') end)
+
+    local function findGetSturdyTarget()
+        if not LocalPlayer then return nil end
+        local ok, dataFolder = pcall(function() return LocalPlayer:FindFirstChild('DataFolder') end)
+        if not ok or not dataFolder then return nil end
+        local info = dataFolder:FindFirstChild('Information')
+        if not info then return nil end
+        local node = info:FindFirstChild('Get Sturdy 2')
+        if not node then return nil end
+        -- the Value stores the key name (single letter) to press
+        return node.Value
+    end
+
+    local function findKnifeTool()
+        if not LocalPlayer then return nil end
+        local function search(container)
+            for _, v in ipairs(container:GetChildren()) do
+                if v:IsA('Tool') and v.Name == '[Knife]' then return v end
+            end
+            return nil
+        end
+        -- search character then backpack
+        if LocalPlayer.Character then
+            local t = search(LocalPlayer.Character)
+            if t then return t end
+        end
+        local backpack = LocalPlayer:FindFirstChild('Backpack')
+        if backpack then
+            local t = search(backpack)
+            if t then return t end
+        end
+        return nil
+    end
+
+    local function instaMacroAction()
+        pcall(function()
+            local keyToPress = findGetSturdyTarget()
+            if keyToPress and type(keyToPress) == 'string' then
+                -- try to simulate the key press via VirtualInputManager if present
+                if VirtualInputManager and type(VirtualInputManager.SendKeyEvent) == 'function' then
+                    pcall(function()
+                        VirtualInputManager:SendKeyEvent(true, tostring(keyToPress), false, game)
+                        task.wait(0.1)
+                        VirtualInputManager:SendKeyEvent(false, tostring(keyToPress), false, game)
+                    end)
+                else
+                    -- VirtualInputManager not available; silent
+                end
+            end
+
+            -- equip knife briefly
+            local hum = LocalPlayer and LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass('Humanoid')
+            if not hum then return end
+            local prev = hum and LocalPlayer.Character:FindFirstChildOfClass('Tool')
+            local knife = findKnifeTool()
+            if not knife then return end
+
+            -- equip
+            pcall(function() hum:EquipTool(knife) end)
+            -- wait 100 ms for the equip/action to register
+            task.wait(0.1)
+            -- restore previous tool or move knife back to backpack
+            if prev and prev.Parent == LocalPlayer.Character and prev ~= knife then
+                pcall(function() hum:EquipTool(prev) end)
+            else
+                local backpack = LocalPlayer:FindFirstChild('Backpack')
+                if backpack then pcall(function() knife.Parent = backpack end) end
+            end
+        end)
+    end
+
+    -- input handler wired to the keypicker value
+safeConnect(UIS.InputBegan, function(input, gameProcessed)
+        if gameProcessed then return end
+        if not Options or not Options.InstaMacroKey then return end
+        local val = Options.InstaMacroKey.Value
+        if not val then return end
+        -- val may be an EnumItem (KeyCode or UserInputType) or string name
+        local matched = false
+        pcall(function()
+            if typeof(val) == 'EnumItem' then
+                -- prefer numeric value compare (some executors expose side buttons as KeyCode or UserInputType with numeric values)
+                local ok, vval = pcall(function() return val.Value end)
+                local ik = (input.KeyCode and input.KeyCode.Value) or nil
+                local iu = (input.UserInputType and input.UserInputType.Value) or nil
+                if ok and vval then
+                    if ik and vval == ik then matched = true end
+                    if iu and vval == iu then matched = true end
+                end
+
+                -- fallback to direct EnumItem equality if the above didn't match
+                if not matched then
+                    if val.EnumType == Enum.KeyCode then
+                        matched = (val == input.KeyCode)
+                    elseif val.EnumType == Enum.UserInputType then
+                        matched = (val == input.UserInputType)
+                    else
+                        matched = (tostring(val) == tostring(input.KeyCode)) or (tostring(val) == tostring(input.UserInputType))
+                    end
+                end
+            elseif type(val) == 'string' then
+                -- compare to KeyCode name or UserInputType name
+                local keyName = nil
+                if input.KeyCode and input.KeyCode.Name then keyName = input.KeyCode.Name end
+                local uitName = input.UserInputType and input.UserInputType.Name or nil
+                matched = (val == keyName) or (val == uitName)
+            end
+        end)
+        if matched then
+            instaMacroAction()
+        end
+    end)
+end
+
+-- Keep the keybinds display window visible by default so users can toggle it on.
+local function setKeybindFrameVisibleSafe(visible)
+    if not Library then
+        return false
+    end
+
+    local frame = nil
+    local okGet = pcall(function()
+        frame = Library.KeybindFrame
+    end)
+    if not okGet or frame == nil then
+        return false
+    end
+
+    local state = visible and true or false
+    local frameType = typeof(frame)
+
+    if frameType == "Instance" then
+        return pcall(function()
+            frame.Visible = state
+        end)
+    end
+
+    if type(frame) == "table" then
+        local changed = false
+        local okVisible = pcall(function()
+            frame.Visible = state
+        end)
+        if okVisible then
+            changed = true
+        end
+        if typeof(frame.Frame) == "Instance" then
+            local ok = pcall(function() frame.Frame.Visible = state end)
+            changed = changed or ok
+        end
+        if typeof(frame.Object) == "Instance" then
+            local ok = pcall(function() frame.Object.Visible = state end)
+            changed = changed or ok
+        end
+        if typeof(frame.Main) == "Instance" then
+            local ok = pcall(function() frame.Main.Visible = state end)
+            changed = changed or ok
+        end
+        if changed then
+            return true
+        end
+    end
+
+    return false
+end
+
+setKeybindFrameVisibleSafe(true)
+
+Library:OnUnload(function()
+    -- unloaded
+    Library.Unloaded = true
+end)
+
+-- UI Settings
+local MenuGroup = Tabs['UI Settings']:AddLeftGroupbox('Menu')
+
+-- Visuals tab: simple ESP (Drawing) implementation
+do
+    local VisualsTab = Tabs.Visuals
+    if VisualsTab then
+        local Left = VisualsTab:AddLeftGroupbox('ESP')
+        Left:AddToggle('ESPEnabled', { Text = 'Enable ESP', Default = false })
+        Left:AddToggle('ESPBoxes', { Text = 'Boxes', Default = true })
+        Left:AddToggle('ESPNames', { Text = 'Names/Health', Default = true })
+        Left:AddToggle('ESPUseHealthColor', { Text = 'HP color by health', Default = true })
+        Left:AddLabel('Box Color')
+            :AddColorPicker('ESPBoxColor', { Default = Color3.fromRGB(255, 255, 255), Title = 'Box Color' })
+        Left:AddLabel('Name Color'):AddColorPicker('ESPNameColor', { Default = Color3.fromRGB(255, 255, 255), Title = 'Name Color' })
+        Left:AddLabel('HP Color'):AddColorPicker('ESPHPColor', { Default = Color3.fromRGB(255, 255, 255), Title = 'HP Color' })
+
+        -- ESP runtime
+        safeSpawn(function()
+            local Players = game:GetService('Players')
+            local RunService = game:GetService('RunService')
+            local Camera = workspace.CurrentCamera
+            local espEnabled = false
+            local drawObjects = {} -- player -> {box = Drawing, name = Drawing, conn = RBXScriptConnection}
+
+            local function canUseDrawingObject(obj)
+                if obj == nil or type(obj) == 'number' then
+                    return false
+                end
+                return pcall(function()
+                    local _ = obj.Visible
+                end)
+            end
+
+            local function setDrawingVisible(obj, state)
+                if not canUseDrawingObject(obj) then
+                    return
+                end
+                pcall(function()
+                    obj.Visible = state and true or false
+                end)
+            end
+
+            -- helper for health color
+            local function getHealthColor(hum)
+                if not hum or not hum.Health or not hum.MaxHealth then return Color3.new(1,1,1) end
+                local pct = hum.Health / (hum.MaxHealth > 0 and hum.MaxHealth or 1)
+                if pct > 0.7 then return Color3.fromRGB(0,255,127) end
+                if pct > 0.3 then return Color3.fromRGB(255,255,0) end
+                return Color3.fromRGB(255,60,60)
+            end
+
+            local function removeESPFor(player)
+                local s = drawObjects[player]
+                if not s then return end
+                pcall(function()
+                    if s.box and s.box.Remove then s.box:Remove() end
+                    if s.name and s.name.Remove then s.name:Remove() end
+                    if s.hp and s.hp.Remove then s.hp:Remove() end
+                    if s.conn and s.conn.Disconnect then s.conn:Disconnect() end
+                end)
+                drawObjects[player] = nil
+            end
+
+            local function createESPFor(player)
+                if drawObjects[player] then return end
+                local ok, box = pcall(function() return Drawing.new('Square') end)
+                local okN, name = pcall(function() return Drawing.new('Text') end)
+                local okH, hp = pcall(function() return Drawing.new('Text') end)
+                if not ok or not okN or not okH then return end
+                if not canUseDrawingObject(box) or not canUseDrawingObject(name) or not canUseDrawingObject(hp) then return end
+
+                setDrawingVisible(box, false)
+                setDrawingVisible(name, false)
+                setDrawingVisible(hp, false)
+                box.Filled = false
+                box.Thickness = 1
+                name.Center = true
+                name.Outline = true
+                hp.Center = true
+                hp.Outline = true
+
+                local conn
+conn = safeConnect(RunService.RenderStepped, function()
+                    if not espEnabled or not player or not player.Character or player == Players.LocalPlayer then
+                            setDrawingVisible(box, false)
+                            setDrawingVisible(name, false)
+                            setDrawingVisible(hp, false)
+                            return
+                        end
+
+                    if not Camera then
+                        Camera = workspace.CurrentCamera
+                    end
+                    if not Camera then
+                        setDrawingVisible(box, false)
+                        setDrawingVisible(name, false)
+                        setDrawingVisible(hp, false)
+                        return
+                    end
+
+                    local root = player.Character:FindFirstChild('HumanoidRootPart')
+                    local head = player.Character:FindFirstChild('Head')
+                    local hum = player.Character:FindFirstChildOfClass('Humanoid')
+                    if not root or not hum then
+                        setDrawingVisible(box, false)
+                        setDrawingVisible(name, false)
+                        setDrawingVisible(hp, false)
+                        return
+                    end
+
+                    local rootPos, onScreen = Camera:WorldToViewportPoint(root.Position)
+                    if not onScreen then
+                        setDrawingVisible(box, false)
+                        setDrawingVisible(name, false)
+                        setDrawingVisible(hp, false)
+                        return
+                    end
+
+                    local headPos = head and Camera:WorldToViewportPoint(head.Position + Vector3.new(0,0.5,0)) or rootPos
+                    local legPos = Camera:WorldToViewportPoint(root.Position - Vector3.new(0,3,0))
+                    local boxHeight = math.abs(headPos.Y - legPos.Y)
+                    local boxWidth = boxHeight / 1.6
+                    local healthColor = getHealthColor(hum)
+
+                    local boxColor = (Options and Options.ESPBoxColor and Options.ESPBoxColor.Value) or healthColor
+                    local nameColor = (Options and Options.ESPNameColor and Options.ESPNameColor.Value) or healthColor
+                    local hpColor = healthColor
+                    -- Use the toggle (Toggles) for ESPUseHealthColor (toggle elements are exposed under Toggles)
+                    local useHealthColor = (Toggles and Toggles.ESPUseHealthColor and Toggles.ESPUseHealthColor.Value) or false
+                    if not useHealthColor then
+                        -- when toggle is OFF, prefer the user-picked HP color from Options
+                        if Options and Options.ESPHPColor then
+                            hpColor = Options.ESPHPColor.Value
+                        end
+                    end
+
+                    if Toggles and Toggles.ESPBoxes and Toggles.ESPBoxes.Value then
+                        setDrawingVisible(box, true)
+                        box.Color = boxColor
+                        box.Size = Vector2.new(boxWidth, boxHeight)
+                        box.Position = Vector2.new(rootPos.X - boxWidth / 2, rootPos.Y - boxHeight / 2)
+                    else
+                        setDrawingVisible(box, false)
+                    end
+
+                    if Toggles and Toggles.ESPNames and Toggles.ESPNames.Value then
+                        setDrawingVisible(name, true)
+                        setDrawingVisible(hp, true)
+                        name.Text = (player.DisplayName or player.Name)
+                        name.Color = nameColor
+                        name.Size = 14
+                        name.Position = Vector2.new(rootPos.X, rootPos.Y - (boxHeight / 2) - 28)
+
+                        hp.Text = math.floor(hum.Health) .. " HP"
+                        hp.Color = hpColor
+                        hp.Size = 13
+                        hp.Position = Vector2.new(rootPos.X, rootPos.Y - (boxHeight / 2) - 12)
+                    else
+                        setDrawingVisible(name, false)
+                        setDrawingVisible(hp, false)
+                    end
+                end)
+
+                drawObjects[player] = { box = box, name = name, hp = hp, conn = conn }
+
+safeConnect(player.AncestryChanged, function() if not player.Parent then removeESPFor(player) end end)
+safeConnect(Players.PlayerRemoving, function(pl) if pl == player then removeESPFor(pl) end end)
+            end
+
+            -- toggle handling
+            if Toggles and Toggles.ESPEnabled then
+                Toggles.ESPEnabled:OnChanged(function()
+                    espEnabled = Toggles.ESPEnabled.Value
+                    if espEnabled then
+                        for _, p in ipairs(Players:GetPlayers()) do
+                            if p ~= Players.LocalPlayer then createESPFor(p) end
+                        end
+                    else
+                        for p, _ in pairs(drawObjects) do removeESPFor(p) end
+                    end
+                end)
+            end
+
+            -- create for players when added
+safeConnect(Players.PlayerAdded, function(p)
+                task.wait(0.05)
+                if Toggles and Toggles.ESPEnabled and Toggles.ESPEnabled.Value then createESPFor(p) end
+            end)
+        end)
+    end
+end
+
+-- I set NoUI so it does not show up in the keybinds menu
+MenuGroup:AddButton('Unload', function() Library:Unload() end)
+MenuGroup:AddLabel('Menu bind'):AddKeyPicker('MenuKeybind', { Default = 'End', NoUI = true, Text = 'Menu keybind' })
+
+-- Optional keybinds list visibility toggle
+MenuGroup:AddToggle('ShowKeybindsList', { Text = 'Show Keybinds List', Default = true })
+
+-- Use the Toggles API for toggle change callbacks (AddToggle creates Toggles.ShowKeybindsList)
+if Toggles and Toggles.ShowKeybindsList then
+    Toggles.ShowKeybindsList:OnChanged(function()
+        setKeybindFrameVisibleSafe(Toggles.ShowKeybindsList.Value)
+    end)
+    -- initialize visibility from the toggle at startup
+    setKeybindFrameVisibleSafe(Toggles.ShowKeybindsList.Value)
+end
+
+-- Safely assign toggle keybind if Options are available
+if Options and Options.MenuKeybind then
+    Library.ToggleKeybind = Options.MenuKeybind -- Allows you to have a custom keybind for the menu
+end
+
+-- Addons:
+-- SaveManager (Allows you to have a configuration system)
+-- ThemeManager (Allows you to have a menu theme system)
+
+-- Hand the library over to our managers
+-- Hand the library over to our managers
+-- Guard these optional manager calls. In some executor/runtime environments
+-- ThemeManager/SaveManager internals may reference CoreGui/locales and can
+-- produce repeated runtime errors. Wrap each call in pcall and do sanity checks
+-- to avoid spamming the console.
+pcall(function()
+    if type(ThemeManager) == 'table' and type(ThemeManager.SetLibrary) == 'function' then
+        pcall(function() ThemeManager:SetLibrary(Library) end)
+    end
+end)
+pcall(function()
+    if type(SaveManager) == 'table' and type(SaveManager.SetLibrary) == 'function' then
+        pcall(function() SaveManager:SetLibrary(Library) end)
+    end
+end)
+
+pcall(function()
+    if type(SaveManager) == 'table' and type(SaveManager.IgnoreThemeSettings) == 'function' then
+        pcall(function() SaveManager:IgnoreThemeSettings() end)
+    end
+end)
+
+pcall(function()
+    if type(SaveManager) == 'table' and type(SaveManager.SetIgnoreIndexes) == 'function' then
+        pcall(function() SaveManager:SetIgnoreIndexes({ 'MenuKeybind' }) end)
+    end
+end)
+
+pcall(function()
+    if type(ThemeManager) == 'table' and type(ThemeManager.SetFolder) == 'function' then
+        pcall(function() ThemeManager:SetFolder('BomzhoodHub') end)
+    end
+    if type(SaveManager) == 'table' and type(SaveManager.SetFolder) == 'function' then
+        pcall(function() SaveManager:SetFolder('BomzhoodHub/BoomHood') end)
+    end
+end)
+
+pcall(function()
+    if type(SaveManager) == 'table' and type(SaveManager.BuildConfigSection) == 'function' and Tabs and Tabs['UI Settings'] then
+        pcall(function() SaveManager:BuildConfigSection(Tabs['UI Settings']) end)
+    end
+end)
+
+pcall(function()
+    if type(ThemeManager) == 'table' and type(ThemeManager.ApplyToTab) == 'function' and Tabs and Tabs['UI Settings'] then
+        pcall(function() ThemeManager:ApplyToTab(Tabs['UI Settings']) end)
+    end
+end)
+
+-- You can use the SaveManager:LoadAutoloadConfig() to load a config
+-- which has been marked to be one that auto loads!
+pcall(function()
+    if type(SaveManager) == 'table' and type(SaveManager.LoadAutoloadConfig) == 'function' then
+        pcall(function() SaveManager:LoadAutoloadConfig() end)
+    end
+end)
+
+-- (handler moved inside Trigger Bot block so it updates the local TriggerWhitelist used by the bot)
+
+-- In-file modern GUI (no external UI library)
+do
+    local Players = game:GetService('Players')
+    local UIS = game:GetService('UserInputService')
+    local TweenService = game:GetService('TweenService')
+    local RunService = game:GetService('RunService')
+    local CoreGui = game:GetService('CoreGui')
+    local LocalPlayer = Players.LocalPlayer
+    if not LocalPlayer then
+        return
+    end
+
+    local palette = {
+        bg = Color3.fromRGB(14, 16, 20),
+        surface = Color3.fromRGB(24, 26, 31),
+        surfaceSoft = Color3.fromRGB(30, 33, 40),
+        surfaceElevated = Color3.fromRGB(41, 46, 56),
+        accent = Color3.fromRGB(232, 181, 92),
+        accentSoft = Color3.fromRGB(246, 210, 144),
+        text = Color3.fromRGB(240, 244, 248),
+        textDim = Color3.fromRGB(170, 180, 196),
+        success = Color3.fromRGB(114, 214, 168),
+        danger = Color3.fromRGB(232, 104, 118),
+        stroke = Color3.fromRGB(96, 104, 122),
+        strokeSoft = Color3.fromRGB(80, 88, 104),
+        shadow = Color3.fromRGB(6, 7, 9),
+    }
+
+    local function applyCorner(obj, radius)
+        local c = Instance.new('UICorner')
+        c.CornerRadius = UDim.new(0, radius or 6)
+        c.Parent = obj
+        return c
+    end
+
+    local function applyStroke(obj, color, thickness, transparency)
+        local s = Instance.new('UIStroke')
+        s.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+        s.Color = color
+        s.Thickness = thickness or 1
+        s.Transparency = transparency or 0
+        s.Parent = obj
+        return s
+    end
+
+    local function tween(obj, time, props, style, direction)
+        if not obj or type(props) ~= 'table' then
+            return nil
+        end
+        local info = TweenInfo.new(
+            time or 0.18,
+            style or Enum.EasingStyle.Quad,
+            direction or Enum.EasingDirection.Out
+        )
+        local tw = TweenService:Create(obj, info, props)
+        tw:Play()
+        return tw
+    end
+
+    local function addHover(frame, baseColor, hoverColor)
+        if not frame then
+            return
+        end
+        safeConnect(frame.MouseEnter, function()
+            tween(frame, 0.12, { BackgroundColor3 = hoverColor })
+        end)
+        safeConnect(frame.MouseLeave, function()
+            tween(frame, 0.18, { BackgroundColor3 = baseColor })
+        end)
+    end
+
+    local function runLater(seconds, fn)
+        if type(fn) ~= 'function' then
+            return
+        end
+        if type(task) == 'table' and type(task.delay) == 'function' then
+            task.delay(seconds, fn)
+        else
+            delay(seconds, fn)
+        end
+    end
+
+    local function createShadow(parent, size, position, radius, transparency)
+        local shadow = Instance.new('Frame')
+        shadow.Name = 'Shadow'
+        shadow.BackgroundColor3 = palette.shadow
+        shadow.BackgroundTransparency = transparency or 0.45
+        shadow.BorderSizePixel = 0
+        shadow.Size = size
+        shadow.Position = position
+        shadow.Active = false
+        shadow.Selectable = false
+        shadow.ZIndex = 0
+        shadow.Parent = parent
+        applyCorner(shadow, radius or 10)
+        return shadow
+    end
+
+    local function resolveParent()
+        local ok, hui = pcall(function()
+            return gethui and gethui()
+        end)
+        if ok and hui then
+            return hui
+        end
+        return CoreGui
+    end
+
+    local function ensureToggle(id, default)
+        if not Toggles[id] then
+            Toggles[id] = makeToggle(id, default == true)
+        end
+        return Toggles[id]
+    end
+
+    local function ensureOption(id, default)
+        if not Options[id] then
+            Options[id] = makeOption(id, default)
+        end
+        return Options[id]
+    end
+
+    local function normalizeSelection(value)
+        local out = {}
+        if type(value) ~= 'table' then
+            return out
+        end
+
+        local hasNumeric = false
+        for k, _ in pairs(value) do
+            if type(k) == 'number' then
+                hasNumeric = true
+                break
+            end
+        end
+
+        if hasNumeric then
+            for _, v in pairs(value) do
+                if type(v) == 'string' then
+                    out[v] = true
+                end
+            end
+            return out
+        end
+
+        for k, v in pairs(value) do
+            if type(k) == 'string' and v then
+                out[k] = true
+            elseif type(v) == 'string' then
+                out[v] = true
+            end
+        end
+
+        return out
+    end
+
+    local function keyName(key)
+        if type(key) == 'table' then
+            key = key.Key or key[1]
+        end
+        if typeof(key) == 'EnumItem' then
+            return key.Name
+        end
+        if key == nil then
+            return 'None'
+        end
+        return tostring(key)
+    end
+
+    local function keyMatch(input, keyVal)
+        if type(keyVal) == 'table' then
+            keyVal = keyVal.Key or keyVal[1]
+        end
+
+        if typeof(keyVal) == 'EnumItem' then
+            if keyVal.EnumType == Enum.KeyCode then
+                return input.KeyCode == keyVal
+            end
+            if keyVal.EnumType == Enum.UserInputType then
+                return input.UserInputType == keyVal
+            end
+        end
+
+        if type(keyVal) == 'string' then
+            local kc = Enum.KeyCode[keyVal]
+            if kc then
+                return input.KeyCode == kc
+            end
+            local ui = Enum.UserInputType[keyVal]
+            if ui then
+                return input.UserInputType == ui
+            end
+            return input.KeyCode.Name == keyVal or input.UserInputType.Name == keyVal
+        end
+
+        return false
+    end
+
+    local function normalizeMode(mode)
+        mode = tostring(mode or 'Hold')
+        if mode == 'Hold' or mode == 'Toggle' or mode == 'Always' then
+            return mode
+        end
+        return 'Hold'
+    end
+
+    local function attachChangeListener(obj, callback)
+        if type(obj) ~= 'table' or type(callback) ~= 'function' then
+            return
+        end
+
+        if not obj.__modernWrapped then
+            obj.__modernWrapped = true
+            obj.__modernListeners = {}
+            local previous = obj.__onchange
+            obj.__onchange = function(...)
+                if type(previous) == 'function' then
+                    pcall(previous, ...)
+                end
+                for _, fn in ipairs(obj.__modernListeners) do
+                    pcall(fn, ...)
+                end
+            end
+        end
+
+        table.insert(obj.__modernListeners, callback)
+    end
+
+    local KeybindOptions = {}
+    local function ensureKeybind(id, defaultKey, defaultMode, storeModeInValue)
+        local init = storeModeInValue and { defaultKey, defaultMode } or defaultKey
+        local opt = ensureOption(id, init)
+
+        if not opt.__kbInit then
+            opt.__kbInit = true
+            opt.__key = defaultKey
+            opt.__mode = normalizeMode(defaultMode)
+            opt.__down = false
+            opt.__toggled = false
+            opt.__storeMode = storeModeInValue == true
+            local baseSet = opt.SetValue
+
+            function opt:_compose()
+                if self.__storeMode then
+                    return { self.__key, self.__mode }
+                end
+                return self.__key
+            end
+
+            function opt:SetMode(m)
+                self.__mode = normalizeMode(m)
+                if self.__mode ~= 'Toggle' then
+                    self.__toggled = false
+                end
+                baseSet(self, self:_compose())
+            end
+
+            function opt:SetValue(v)
+                if type(v) == 'table' then
+                    local k = v.Key or v[1]
+                    local m = v.Mode or v[2]
+                    if k ~= nil then
+                        self.__key = k
+                    end
+                    if m ~= nil then
+                        self.__mode = normalizeMode(m)
+                    end
+                elseif v ~= nil then
+                    self.__key = v
+                end
+                baseSet(self, self:_compose())
+            end
+
+            function opt:GetState()
+                if self.__mode == 'Always' then
+                    return true
+                end
+                if self.__mode == 'Toggle' then
+                    return self.__toggled == true
+                end
+                return self.__down == true
+            end
+        end
+
+        if type(opt.Value) == 'table' then
+            local k = opt.Value.Key or opt.Value[1]
+            local m = opt.Value.Mode or opt.Value[2]
+            if k ~= nil then
+                opt.__key = k
+            end
+            if m ~= nil then
+                opt.__mode = normalizeMode(m)
+            end
+        elseif opt.Value ~= nil then
+            opt.__key = opt.Value
+        end
+
+        opt:SetValue(opt.__storeMode and { opt.__key, opt.__mode } or opt.__key)
+        KeybindOptions[opt] = true
+        return opt
+    end
+
+    local HitboxEnable = ensureToggle('HitboxEnable', false)
+    local HitboxShow = ensureToggle('HitboxShow', true)
+    local AutoRev = ensureToggle('AutoRev', false)
+    local TriggerEnabled = ensureToggle('TriggerEnabled', false)
+    local TriggerThroughWalls = ensureToggle('TriggerThroughWalls', false)
+    local ESPEnabled = ensureToggle('ESPEnabled', false)
+    local ESPBoxes = ensureToggle('ESPBoxes', true)
+    local ESPNames = ensureToggle('ESPNames', true)
+    local ESPUseHealthColor = ensureToggle('ESPUseHealthColor', true)
+    local ShowKeybindsList = ensureToggle('ShowKeybindsList', true)
+    local AutoShotEnabled = ensureToggle('AutoShotEnabled', true)
+    local AutoShotQuickSelectEnabled = ensureToggle('AutoShotQuickSelectEnabled', true)
+
+    local HitboxSizeSlider = ensureOption('HitboxSizeSlider', 0)
+    local HitboxWhitelist = ensureOption('HitboxWhitelist', {})
+    local TriggerDelay = ensureOption('TriggerDelay', 0)
+    local TriggerWhitelist = ensureOption('TriggerWhitelist', {})
+    local HitboxColor = ensureOption('HitboxColor', Color3.fromRGB(37, 115, 184))
+    local ESPBoxColor = ensureOption('ESPBoxColor', Color3.fromRGB(255, 255, 255))
+    local ESPNameColor = ensureOption('ESPNameColor', Color3.fromRGB(255, 255, 255))
+    local ESPHPColor = ensureOption('ESPHPColor', Color3.fromRGB(255, 255, 255))
+    local AutoShotMode = ensureOption('AutoShotMode', 'BURST')
+    local AutoShotTargetPlayer = ensureOption('AutoShotTargetPlayer', '')
+    local AutoShotDelayMin = ensureOption('AutoShotDelayMin', 130)
+    local AutoShotDelayMax = ensureOption('AutoShotDelayMax', 200)
+
+    local TriggerKey = ensureKeybind('TriggerKey', Enum.KeyCode.C, 'Hold', true)
+    local AutoShotKey = ensureKeybind('AutoShotKey', Enum.KeyCode.X, 'Hold', true)
+    local InstaKey = ensureKeybind('InstaMacroKey', Enum.KeyCode.Insert, 'Hold', false)
+    local MenuKey = ensureKeybind('MenuKeybind', Enum.KeyCode.End, 'Hold', false)
+
+    local parent = resolveParent()
+    if not parent then
+        return
+    end
+
+    pcall(function()
+        for _, name in ipairs({
+            'BomzhoodInlineMenu',
+            'BomzhoodModernMenu',
+            'BomzhoodModernKeybinds',
+        }) do
+            local oldUi = parent:FindFirstChild(name)
+            if oldUi then
+                oldUi:Destroy()
+            end
+        end
+    end)
+
+    local screen = Instance.new('ScreenGui')
+    screen.Name = 'BomzhoodModernMenu'
+    screen.ResetOnSpawn = false
+    screen.IgnoreGuiInset = true
+    screen.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+    screen.DisplayOrder = 999
+    screen.Parent = parent
+
+    local menuGroup = Instance.new('CanvasGroup')
+    menuGroup.Name = 'MenuGroup'
+    menuGroup.BackgroundTransparency = 1
+    menuGroup.Size = UDim2.new(1, 0, 1, 0)
+    menuGroup.GroupTransparency = 0
+    menuGroup.Parent = screen
+
+    local keybindScreen = Instance.new('ScreenGui')
+    keybindScreen.Name = 'BomzhoodModernKeybinds'
+    keybindScreen.ResetOnSpawn = false
+    keybindScreen.IgnoreGuiInset = true
+    keybindScreen.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+    keybindScreen.DisplayOrder = 1000
+    keybindScreen.Parent = parent
+
+    local keybindGroup = Instance.new('CanvasGroup')
+    keybindGroup.Name = 'KeybindGroup'
+    keybindGroup.BackgroundTransparency = 1
+    keybindGroup.Size = UDim2.new(1, 0, 1, 0)
+    keybindGroup.GroupTransparency = 0
+    keybindGroup.Parent = keybindScreen
+
+    local keybindConnections = {}
+    local function trackKeybindConnection(conn)
+        if conn then
+            table.insert(keybindConnections, conn)
+        end
+        return conn
+    end
+
+    local keybindWindow = Instance.new('Frame')
+    keybindWindow.Name = 'Keybinds'
+    keybindWindow.Size = UDim2.fromOffset(190, 68)
+    keybindWindow.Position = UDim2.fromOffset(28, 190)
+    keybindWindow.BackgroundColor3 = palette.surface
+    keybindWindow.Parent = keybindGroup
+    applyCorner(keybindWindow, 10)
+    applyStroke(keybindWindow, palette.stroke, 1, 0.5)
+
+    local keybindGradient = Instance.new('UIGradient')
+    keybindGradient.Color = ColorSequence.new({
+        ColorSequenceKeypoint.new(0, palette.surface),
+        ColorSequenceKeypoint.new(1, palette.surfaceSoft)
+    })
+    keybindGradient.Rotation = 90
+    keybindGradient.Parent = keybindWindow
+
+    local keybindHeader = Instance.new('Frame')
+    keybindHeader.Name = 'Header'
+    keybindHeader.Size = UDim2.new(1, 0, 0, 26)
+    keybindHeader.BackgroundColor3 = palette.surfaceElevated
+    keybindHeader.Parent = keybindWindow
+    applyCorner(keybindHeader, 9)
+
+    local keybindTitle = Instance.new('TextLabel')
+    keybindTitle.BackgroundTransparency = 1
+    keybindTitle.Position = UDim2.fromOffset(8, 0)
+    keybindTitle.Size = UDim2.new(1, -12, 1, 0)
+    keybindTitle.Font = Enum.Font.GothamBold
+    keybindTitle.TextColor3 = palette.accentSoft
+    keybindTitle.TextSize = 12
+    keybindTitle.TextXAlignment = Enum.TextXAlignment.Left
+    keybindTitle.Text = 'Keybinds'
+    keybindTitle.Parent = keybindHeader
+
+    local keybindAccent = Instance.new('Frame')
+    keybindAccent.Name = 'Accent'
+    keybindAccent.BackgroundTransparency = 0.2
+    keybindAccent.Position = UDim2.fromOffset(6, 22)
+    keybindAccent.Size = UDim2.new(1, -12, 0, 2)
+    keybindAccent.BackgroundColor3 = palette.accent
+    keybindAccent.Parent = keybindHeader
+    applyCorner(keybindAccent, 2)
+
+    local keybindBody = Instance.new('Frame')
+    keybindBody.BackgroundTransparency = 1
+    keybindBody.Position = UDim2.fromOffset(0, 28)
+    keybindBody.Size = UDim2.new(1, 0, 1, -30)
+    keybindBody.Parent = keybindWindow
+
+    local keybindBodyPad = Instance.new('UIPadding')
+    keybindBodyPad.PaddingTop = UDim.new(0, 4)
+    keybindBodyPad.PaddingLeft = UDim.new(0, 6)
+    keybindBodyPad.PaddingRight = UDim.new(0, 6)
+    keybindBodyPad.PaddingBottom = UDim.new(0, 6)
+    keybindBodyPad.Parent = keybindBody
+
+    local keybindBodyList = Instance.new('UIListLayout')
+    keybindBodyList.Padding = UDim.new(0, 4)
+    keybindBodyList.Parent = keybindBody
+
+    local keybindRows = {}
+    local function createKeybindListRow(labelText, optionObj)
+        local row = Instance.new('Frame')
+        row.BackgroundColor3 = palette.surfaceElevated
+        row.Size = UDim2.new(1, 0, 0, 28)
+        row.Parent = keybindBody
+        applyCorner(row, 6)
+
+        local label = Instance.new('TextLabel')
+        label.BackgroundTransparency = 1
+        label.Position = UDim2.fromOffset(8, 0)
+        label.Size = UDim2.new(0, 58, 1, 0)
+        label.Font = Enum.Font.GothamSemibold
+        label.TextColor3 = palette.text
+        label.TextSize = 11
+        label.TextXAlignment = Enum.TextXAlignment.Left
+        label.Text = labelText
+        label.Parent = row
+
+        local value = Instance.new('TextLabel')
+        value.BackgroundTransparency = 1
+        value.Position = UDim2.fromOffset(68, 0)
+        value.Size = UDim2.new(1, -76, 1, 0)
+        value.Font = Enum.Font.Gotham
+        value.TextColor3 = palette.danger
+        value.TextSize = 11
+        value.TextXAlignment = Enum.TextXAlignment.Right
+        value.Text = ''
+        value.Parent = row
+
+        table.insert(keybindRows, {
+            option = optionObj,
+            value = value,
+        })
+    end
+
+    createKeybindListRow('Trigger', TriggerKey)
+    createKeybindListRow('AutoShot', AutoShotKey)
+
+    local function updateKeybindWindowSize()
+        local contentHeight = keybindBodyPad.PaddingTop.Offset
+            + keybindBodyPad.PaddingBottom.Offset
+            + keybindBodyList.AbsoluteContentSize.Y
+        local targetHeight = 28 + contentHeight + 2
+        keybindWindow.Size = UDim2.fromOffset(190, math.max(targetHeight, 52))
+    end
+    trackKeybindConnection(safeConnect(keybindBodyList:GetPropertyChangedSignal('AbsoluteContentSize'), updateKeybindWindowSize))
+    updateKeybindWindowSize()
+    
+    local function keybindIsActive(optionObj)
+        local mode = tostring(optionObj.__mode or 'Hold')
+        if mode == 'Always' then
+            return true
+        end
+        if mode == 'Toggle' then
+            return optionObj.__toggled == true
+        end
+        return optionObj.__down == true
+    end
+
+    local function refreshKeybindWindow()
+        for _, row in ipairs(keybindRows) do
+            local mode = tostring(row.option.__mode or 'Hold')
+            local active = keybindIsActive(row.option)
+            row.value.Text = string.format('%s / %s', keyName(row.option.Value), mode)
+            row.value.TextColor3 = active and palette.success or palette.danger
+        end
+    end
+
+    local function setKeybindWindowVisible()
+        local show = ShowKeybindsList.Value == true
+        if show then
+            keybindWindow.Visible = true
+            keybindGroup.GroupTransparency = 1
+            tween(keybindGroup, 0.16, { GroupTransparency = 0 })
+        else
+            tween(keybindGroup, 0.14, { GroupTransparency = 1 })
+            runLater(0.15, function()
+                keybindWindow.Visible = false
+            end)
+        end
+    end
+
+    attachChangeListener(ShowKeybindsList, setKeybindWindowVisible)
+    setKeybindWindowVisible()
+    refreshKeybindWindow()
+    trackKeybindConnection(safeConnect(RunService.RenderStepped, refreshKeybindWindow))
+
+    local kbDragging = false
+    local kbDragInput = nil
+    local kbDragStart = nil
+    local kbStartPos = nil
+
+safeConnect(keybindHeader.InputBegan, function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            kbDragging = true
+            kbDragStart = input.Position
+            kbStartPos = keybindWindow.Position
+safeConnect(input.Changed, function()
+                if input.UserInputState == Enum.UserInputState.End then
+                    kbDragging = false
+                end
+            end)
+        end
+    end)
+
+safeConnect(keybindHeader.InputChanged, function(input)
+        if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
+            kbDragInput = input
+        end
+    end)
+
+trackKeybindConnection(safeConnect(UIS.InputChanged, function(input)
+        if kbDragging and input == kbDragInput then
+            local delta = input.Position - kbDragStart
+            keybindWindow.Position = UDim2.new(
+                kbStartPos.X.Scale,
+                kbStartPos.X.Offset + delta.X,
+                kbStartPos.Y.Scale,
+                kbStartPos.Y.Offset + delta.Y
+            )
+        end
+    end))
+
+    local main = Instance.new('Frame')
+    main.Name = 'Main'
+    main.Size = UDim2.fromOffset(760, 520)
+    main.Position = UDim2.new(0.5, -380, 0.5, -260)
+    main.BackgroundColor3 = palette.bg
+    main.Parent = menuGroup
+    applyCorner(main, 12)
+    applyStroke(main, palette.stroke, 1, 0.42)
+
+    local mainTargetSize = main.Size
+    local mainTargetPos = main.Position
+
+    local mainGradient = Instance.new('UIGradient')
+    mainGradient.Color = ColorSequence.new({
+        ColorSequenceKeypoint.new(0, Color3.fromRGB(26, 29, 36)),
+        ColorSequenceKeypoint.new(1, Color3.fromRGB(16, 18, 24))
+    })
+    mainGradient.Rotation = 132
+    mainGradient.Parent = main
+
+    local header = Instance.new('Frame')
+    header.Name = 'Header'
+    header.Size = UDim2.new(1, 0, 0, 60)
+    header.BackgroundTransparency = 1
+    header.Parent = main
+
+    local headerBackdrop = Instance.new('Frame')
+    headerBackdrop.Name = 'Backdrop'
+    headerBackdrop.BackgroundColor3 = palette.surface
+    headerBackdrop.BackgroundTransparency = 0.2
+    headerBackdrop.Size = UDim2.new(1, 0, 1, 0)
+    headerBackdrop.Active = false
+    headerBackdrop.Selectable = false
+    headerBackdrop.Parent = header
+    headerBackdrop.ZIndex = 1
+    applyCorner(headerBackdrop, 12)
+
+    local headerGradient = Instance.new('UIGradient')
+    headerGradient.Color = ColorSequence.new({
+        ColorSequenceKeypoint.new(0, palette.surface),
+        ColorSequenceKeypoint.new(1, palette.surfaceSoft)
+    })
+    headerGradient.Rotation = 90
+    headerGradient.Parent = headerBackdrop
+
+    local title = Instance.new('TextLabel')
+    title.Name = 'Title'
+    title.BackgroundTransparency = 1
+    title.Position = UDim2.fromOffset(18, 10)
+    title.Size = UDim2.new(1, -160, 0, 24)
+    title.Font = Enum.Font.GothamBold
+    title.TextColor3 = palette.text
+    title.TextSize = 22
+    title.TextStrokeColor3 = palette.shadow
+    title.TextStrokeTransparency = 0.7
+    title.TextXAlignment = Enum.TextXAlignment.Left
+    title.Text = 'Bomzhood Hub'
+    title.Parent = header
+    title.ZIndex = 2
+
+    local subtitle = Instance.new('TextLabel')
+    subtitle.Name = 'Subtitle'
+    subtitle.BackgroundTransparency = 1
+    subtitle.Position = UDim2.fromOffset(18, 33)
+    subtitle.Size = UDim2.new(1, -220, 0, 18)
+    subtitle.Font = Enum.Font.GothamMedium
+    subtitle.TextColor3 = palette.textDim
+    subtitle.TextSize = 12
+    subtitle.TextXAlignment = Enum.TextXAlignment.Left
+    subtitle.Text = ''
+    subtitle.Parent = header
+    subtitle.ZIndex = 2
+
+    local accentLine = Instance.new('Frame')
+    accentLine.Name = 'Accent'
+    accentLine.BackgroundTransparency = 0.2
+    accentLine.Position = UDim2.fromOffset(18, 54)
+    accentLine.Size = UDim2.new(1, -36, 0, 3)
+    accentLine.BackgroundColor3 = palette.accent
+    accentLine.Parent = header
+    applyCorner(accentLine, 2)
+    accentLine.ZIndex = 2
+
+    local closeBtn = Instance.new('TextButton')
+    closeBtn.Name = 'Close'
+    closeBtn.AnchorPoint = Vector2.new(1, 0)
+    closeBtn.Position = UDim2.new(1, -16, 0, 12)
+    closeBtn.Size = UDim2.fromOffset(34, 34)
+    closeBtn.Font = Enum.Font.GothamBold
+    closeBtn.TextSize = 18
+    closeBtn.Text = 'X'
+    closeBtn.TextColor3 = palette.text
+    closeBtn.BackgroundColor3 = palette.surface
+    closeBtn.AutoButtonColor = false
+    closeBtn.Parent = header
+    applyCorner(closeBtn, 8)
+    applyStroke(closeBtn, palette.strokeSoft, 1, 0.45)
+    closeBtn.ZIndex = 3
+
+    local closeDefault = closeBtn.BackgroundColor3
+safeConnect(closeBtn.MouseEnter, function()
+        tween(closeBtn, 0.12, { BackgroundColor3 = palette.accent, TextColor3 = palette.bg })
+    end)
+safeConnect(closeBtn.MouseLeave, function()
+        tween(closeBtn, 0.18, { BackgroundColor3 = closeDefault, TextColor3 = palette.text })
+    end)
+
+    local body = Instance.new('Frame')
+    body.Name = 'Body'
+    body.BackgroundTransparency = 1
+    body.Position = UDim2.fromOffset(0, 60)
+    body.Size = UDim2.new(1, 0, 1, -60)
+    body.Parent = main
+
+    local sidebar = Instance.new('Frame')
+    sidebar.Name = 'Sidebar'
+    sidebar.BackgroundColor3 = palette.surface
+    sidebar.Size = UDim2.new(0, 190, 1, -14)
+    sidebar.Position = UDim2.fromOffset(10, 7)
+    sidebar.Parent = body
+    applyCorner(sidebar, 12)
+    applyStroke(sidebar, palette.strokeSoft, 1, 0.55)
+
+    local sidebarGradient = Instance.new('UIGradient')
+    sidebarGradient.Color = ColorSequence.new({
+        ColorSequenceKeypoint.new(0, palette.surface),
+        ColorSequenceKeypoint.new(1, palette.surfaceSoft)
+    })
+    sidebarGradient.Rotation = 90
+    sidebarGradient.Parent = sidebar
+
+    local sidePadding = Instance.new('UIPadding')
+    sidePadding.PaddingTop = UDim.new(0, 12)
+    sidePadding.PaddingLeft = UDim.new(0, 10)
+    sidePadding.PaddingRight = UDim.new(0, 10)
+    sidePadding.PaddingBottom = UDim.new(0, 12)
+    sidePadding.Parent = sidebar
+
+    local sideLayout = Instance.new('UIListLayout')
+    sideLayout.Padding = UDim.new(0, 8)
+    sideLayout.Parent = sidebar
+
+    local content = Instance.new('Frame')
+    content.Name = 'Content'
+    content.BackgroundColor3 = palette.surface
+    content.Position = UDim2.fromOffset(210, 7)
+    content.Size = UDim2.new(1, -220, 1, -14)
+    content.Parent = body
+    applyCorner(content, 12)
+    applyStroke(content, palette.strokeSoft, 1, 0.55)
+
+    local contentGradient = Instance.new('UIGradient')
+    contentGradient.Color = ColorSequence.new({
+        ColorSequenceKeypoint.new(0, palette.surface),
+        ColorSequenceKeypoint.new(1, palette.surfaceSoft)
+    })
+    contentGradient.Rotation = 90
+    contentGradient.Parent = content
+
+    local pagesRoot = Instance.new('Frame')
+    pagesRoot.BackgroundTransparency = 1
+    pagesRoot.Size = UDim2.new(1, 0, 1, 0)
+    pagesRoot.Parent = content
+
+    local function createPage()
+        local page = Instance.new('ScrollingFrame')
+        page.BackgroundTransparency = 1
+        page.BorderSizePixel = 0
+        page.Size = UDim2.new(1, 0, 1, 0)
+        page.CanvasSize = UDim2.fromOffset(0, 0)
+        page.AutomaticCanvasSize = Enum.AutomaticSize.None
+        page.ScrollBarThickness = 5
+        page.ScrollBarImageColor3 = palette.surfaceElevated
+        page.Visible = false
+        page.Parent = pagesRoot
+
+        local pad = Instance.new('UIPadding')
+        pad.PaddingTop = UDim.new(0, 12)
+        pad.PaddingLeft = UDim.new(0, 12)
+        pad.PaddingRight = UDim.new(0, 12)
+        pad.PaddingBottom = UDim.new(0, 12)
+        pad.Parent = page
+
+        local leftCol = Instance.new('Frame')
+        leftCol.BackgroundTransparency = 1
+        leftCol.Position = UDim2.new(0, 0, 0, 0)
+        leftCol.Size = UDim2.new(0.5, -6, 0, 0)
+        leftCol.AutomaticSize = Enum.AutomaticSize.Y
+        leftCol.Parent = page
+
+        local leftLayout = Instance.new('UIListLayout')
+        leftLayout.Padding = UDim.new(0, 10)
+        leftLayout.Parent = leftCol
+
+        local rightCol = Instance.new('Frame')
+        rightCol.BackgroundTransparency = 1
+        rightCol.Position = UDim2.new(0.5, 6, 0, 0)
+        rightCol.Size = UDim2.new(0.5, -6, 0, 0)
+        rightCol.AutomaticSize = Enum.AutomaticSize.Y
+        rightCol.Parent = page
+
+        local rightLayout = Instance.new('UIListLayout')
+        rightLayout.Padding = UDim.new(0, 10)
+        rightLayout.Parent = rightCol
+
+        local function updateCanvas()
+            local leftH = leftLayout.AbsoluteContentSize.Y
+            local rightH = rightLayout.AbsoluteContentSize.Y
+            local h = math.max(leftH, rightH) + 24
+            page.CanvasSize = UDim2.fromOffset(0, h)
+        end
+
+        safeConnect(leftLayout:GetPropertyChangedSignal('AbsoluteContentSize'), updateCanvas)
+        safeConnect(rightLayout:GetPropertyChangedSignal('AbsoluteContentSize'), updateCanvas)
+        updateCanvas()
+
+        return {
+            root = page,
+            left = leftCol,
+            right = rightCol,
+            nextColumn = 1
+        }
+    end
+
+    local function createSection(page, heading)
+        local pageObj = page
+        local targetColumn = pageObj.left
+        if pageObj.nextColumn == 2 then
+            targetColumn = pageObj.right
+        end
+        pageObj.nextColumn = pageObj.nextColumn == 1 and 2 or 1
+
+        local section = Instance.new('Frame')
+        section.BackgroundColor3 = palette.surfaceSoft
+        section.Size = UDim2.new(1, 0, 0, 0)
+        section.AutomaticSize = Enum.AutomaticSize.Y
+        section.Parent = targetColumn
+        applyCorner(section, 8)
+        applyStroke(section, palette.strokeSoft, 1, 0.58)
+
+        local outerPad = Instance.new('UIPadding')
+        outerPad.PaddingTop = UDim.new(0, 8)
+        outerPad.PaddingLeft = UDim.new(0, 10)
+        outerPad.PaddingRight = UDim.new(0, 10)
+        outerPad.PaddingBottom = UDim.new(0, 10)
+        outerPad.Parent = section
+
+        local titleLabel = Instance.new('TextLabel')
+        titleLabel.BackgroundTransparency = 1
+        titleLabel.Size = UDim2.new(1, 0, 0, 20)
+        titleLabel.Font = Enum.Font.GothamSemibold
+        titleLabel.TextColor3 = palette.text
+        titleLabel.TextSize = 16
+        titleLabel.TextXAlignment = Enum.TextXAlignment.Left
+        titleLabel.Text = heading
+        titleLabel.Parent = section
+
+        local separator = Instance.new('Frame')
+        separator.BorderSizePixel = 0
+        separator.BackgroundColor3 = palette.strokeSoft
+        separator.BackgroundTransparency = 0.45
+        separator.Position = UDim2.fromOffset(0, 24)
+        separator.Size = UDim2.new(1, 0, 0, 1)
+        separator.Parent = section
+
+        local content = Instance.new('Frame')
+        content.BackgroundTransparency = 1
+        content.Position = UDim2.fromOffset(0, 30)
+        content.Size = UDim2.new(1, 0, 0, 0)
+        content.AutomaticSize = Enum.AutomaticSize.Y
+        content.Parent = section
+
+        local layout = Instance.new('UIListLayout')
+        layout.Padding = UDim.new(0, 8)
+        layout.Parent = content
+
+        return content
+    end
+
+    local function createToggle(parent, caption, toggleObj, detail)
+        local row = Instance.new('Frame')
+        row.BackgroundColor3 = palette.surfaceElevated
+        row.Size = UDim2.new(1, 0, 0, detail and 58 or 44)
+        row.Parent = parent
+        applyCorner(row, 6)
+        addHover(row, palette.surfaceElevated, palette.surfaceSoft)
+
+        local label = Instance.new('TextLabel')
+        label.BackgroundTransparency = 1
+        label.Position = UDim2.fromOffset(12, 6)
+        label.Size = UDim2.new(1, -90, 0, 20)
+        label.Font = Enum.Font.GothamSemibold
+        label.TextColor3 = palette.text
+        label.TextSize = 13
+        label.TextXAlignment = Enum.TextXAlignment.Left
+        label.Text = caption
+        label.Parent = row
+
+        if detail then
+            local hint = Instance.new('TextLabel')
+            hint.BackgroundTransparency = 1
+            hint.Position = UDim2.fromOffset(12, 28)
+            hint.Size = UDim2.new(1, -90, 0, 18)
+            hint.Font = Enum.Font.Gotham
+            hint.TextColor3 = palette.textDim
+            hint.TextSize = 11
+            hint.TextXAlignment = Enum.TextXAlignment.Left
+            hint.Text = detail
+            hint.Parent = row
+        end
+
+        local switch = Instance.new('TextButton')
+        switch.AutoButtonColor = false
+        switch.AnchorPoint = Vector2.new(1, 0.5)
+        switch.Position = UDim2.new(1, -12, 0.5, 0)
+        switch.Size = UDim2.fromOffset(46, 24)
+        switch.Text = ''
+        switch.BackgroundColor3 = palette.surface
+        switch.Parent = row
+        applyCorner(switch, 6)
+
+        local knob = Instance.new('Frame')
+        knob.Size = UDim2.fromOffset(18, 18)
+        knob.Position = UDim2.new(0, 2, 0.5, -9)
+        knob.BackgroundColor3 = palette.text
+        knob.Parent = switch
+        applyCorner(knob, 9)
+
+        local function render()
+            local state = toggleObj.Value == true
+            local targetPos = UDim2.new(0, state and 26 or 2, 0.5, -9)
+            local targetColor = state and palette.accent or palette.surface
+            tween(switch, 0.16, { BackgroundColor3 = targetColor })
+            tween(knob, 0.16, { Position = targetPos })
+        end
+
+safeConnect(switch.MouseButton1Click, function()
+            toggleObj:SetValue(not (toggleObj.Value == true))
+            render()
+        end)
+        attachChangeListener(toggleObj, render)
+        render()
+    end
+
+    local function roundStep(value, minValue, maxValue, step)
+        local v = math.clamp(value, minValue, maxValue)
+        local s = step or 1
+        if s > 0 then
+            v = math.floor((v / s) + 0.5) * s
+        end
+        return math.clamp(v, minValue, maxValue)
+    end
+
+    local function createSlider(parent, caption, optionObj, minValue, maxValue, step, suffix)
+        local row = Instance.new('Frame')
+        row.BackgroundColor3 = palette.surfaceElevated
+        row.Size = UDim2.new(1, 0, 0, 58)
+        row.Parent = parent
+        applyCorner(row, 6)
+        addHover(row, palette.surfaceElevated, palette.surfaceSoft)
+
+        local label = Instance.new('TextLabel')
+        label.BackgroundTransparency = 1
+        label.Position = UDim2.fromOffset(12, 6)
+        label.Size = UDim2.new(1, -120, 0, 18)
+        label.Font = Enum.Font.GothamSemibold
+        label.TextColor3 = palette.text
+        label.TextSize = 13
+        label.TextXAlignment = Enum.TextXAlignment.Left
+        label.Text = caption
+        label.Parent = row
+
+        local valueLabel = Instance.new('TextLabel')
+        valueLabel.BackgroundTransparency = 1
+        valueLabel.AnchorPoint = Vector2.new(1, 0)
+        valueLabel.Position = UDim2.new(1, -12, 0, 6)
+        valueLabel.Size = UDim2.fromOffset(94, 18)
+        valueLabel.Font = Enum.Font.GothamSemibold
+        valueLabel.TextColor3 = palette.accentSoft
+        valueLabel.TextSize = 12
+        valueLabel.TextXAlignment = Enum.TextXAlignment.Right
+        valueLabel.Parent = row
+
+        local track = Instance.new('TextButton')
+        track.AutoButtonColor = false
+        track.Text = ''
+        track.BackgroundColor3 = palette.surface
+        track.Position = UDim2.fromOffset(12, 31)
+        track.Size = UDim2.new(1, -24, 0, 16)
+        track.Parent = row
+        applyCorner(track, 8)
+
+        local fill = Instance.new('Frame')
+        fill.BackgroundColor3 = palette.accent
+        fill.Size = UDim2.new(0, 0, 1, 0)
+        fill.Parent = track
+        applyCorner(fill, 8)
+
+        local dragging = false
+
+        local function render(instant)
+            local raw = tonumber(optionObj.Value) or minValue
+            local value = roundStep(raw, minValue, maxValue, step)
+            local pct = 0
+            if maxValue > minValue then
+                pct = (value - minValue) / (maxValue - minValue)
+            end
+            local target = UDim2.new(math.clamp(pct, 0, 1), 0, 1, 0)
+            if instant then
+                fill.Size = target
+            else
+                tween(fill, 0.12, { Size = target })
+            end
+            valueLabel.Text = tostring(math.floor(value + 0.5)) .. (suffix or '')
+        end
+
+        local function setFromX(x)
+            local left = track.AbsolutePosition.X
+            local right = left + track.AbsoluteSize.X
+            local pct = 0
+            if right > left then
+                pct = math.clamp((x - left) / (right - left), 0, 1)
+            end
+            local value = minValue + ((maxValue - minValue) * pct)
+            value = roundStep(value, minValue, maxValue, step)
+            optionObj:SetValue(value)
+            render(true)
+        end
+
+safeConnect(track.InputBegan, function(input)
+            if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+                dragging = true
+                setFromX(input.Position.X)
+            end
+        end)
+
+safeConnect(track.InputChanged, function(input)
+            if not dragging then
+                return
+            end
+            if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
+                setFromX(input.Position.X)
+            end
+        end)
+
+safeConnect(track.InputEnded, function(input)
+            if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+                dragging = false
+            end
+        end)
+
+safeConnect(track.MouseButton1Up, function()
+            dragging = false
+        end)
+
+safeConnect(track.MouseLeave, function()
+            if not UIS:IsMouseButtonPressed(Enum.UserInputType.MouseButton1) then
+                dragging = false
+            end
+        end)
+
+        attachChangeListener(optionObj, function()
+            render(false)
+        end)
+        render(true)
+    end
+
+    local function colorToRGB(color)
+        local c = typeof(color) == 'Color3' and color or Color3.fromRGB(255, 255, 255)
+        return {
+            r = math.floor(c.R * 255 + 0.5),
+            g = math.floor(c.G * 255 + 0.5),
+            b = math.floor(c.B * 255 + 0.5)
+        }
+    end
+
+    local function rgbToColor(ch)
+        local r = math.clamp(math.floor((tonumber(ch.r) or 0) + 0.5), 0, 255)
+        local g = math.clamp(math.floor((tonumber(ch.g) or 0) + 0.5), 0, 255)
+        local b = math.clamp(math.floor((tonumber(ch.b) or 0) + 0.5), 0, 255)
+        return Color3.fromRGB(r, g, b)
+    end
+
+    local function colorToHex(color)
+        local c = colorToRGB(color)
+        return string.format('#%02X%02X%02X', c.r, c.g, c.b)
+    end
+
+    local function hexToColor(text)
+        if type(text) ~= 'string' then
+            return nil
+        end
+        local hex = text:gsub('%s+', ''):gsub('#', '')
+        if #hex == 3 then
+            hex = string.format('%s%s%s%s%s%s',
+                hex:sub(1, 1), hex:sub(1, 1),
+                hex:sub(2, 2), hex:sub(2, 2),
+                hex:sub(3, 3), hex:sub(3, 3))
+        end
+        if #hex ~= 6 then
+            return nil
+        end
+        local r = tonumber(hex:sub(1, 2), 16)
+        local g = tonumber(hex:sub(3, 4), 16)
+        local b = tonumber(hex:sub(5, 6), 16)
+        if not r or not g or not b then
+            return nil
+        end
+        return Color3.fromRGB(r, g, b)
+    end
+
+    local activeColorPanel = nil
+
+    local function createColorRow(parent, caption, optionObj)
+        local wrap = Instance.new('Frame')
+        wrap.BackgroundColor3 = palette.surfaceElevated
+        wrap.Size = UDim2.new(1, 0, 0, 42)
+        wrap.AutomaticSize = Enum.AutomaticSize.Y
+        wrap.Parent = parent
+        applyCorner(wrap, 6)
+        addHover(wrap, palette.surfaceElevated, palette.surfaceSoft)
+
+        local pad = Instance.new('UIPadding')
+        pad.PaddingTop = UDim.new(0, 8)
+        pad.PaddingBottom = UDim.new(0, 8)
+        pad.PaddingLeft = UDim.new(0, 10)
+        pad.PaddingRight = UDim.new(0, 10)
+        pad.Parent = wrap
+
+        local stack = Instance.new('UIListLayout')
+        stack.Padding = UDim.new(0, 7)
+        stack.Parent = wrap
+
+        local headerRow = Instance.new('Frame')
+        headerRow.BackgroundTransparency = 1
+        headerRow.Size = UDim2.new(1, 0, 0, 24)
+        headerRow.Parent = wrap
+
+        local label = Instance.new('TextLabel')
+        label.BackgroundTransparency = 1
+        label.Size = UDim2.new(1, -130, 1, 0)
+        label.Font = Enum.Font.GothamSemibold
+        label.TextColor3 = palette.text
+        label.TextSize = 13
+        label.TextXAlignment = Enum.TextXAlignment.Left
+        label.Text = caption
+        label.Parent = headerRow
+
+        local colorButton = Instance.new('TextButton')
+        colorButton.AutoButtonColor = false
+        colorButton.AnchorPoint = Vector2.new(1, 0)
+        colorButton.Position = UDim2.new(1, 0, 0, 0)
+        colorButton.Size = UDim2.fromOffset(52, 24)
+        colorButton.Text = ''
+        colorButton.Parent = headerRow
+        applyCorner(colorButton, 6)
+        applyStroke(colorButton, palette.strokeSoft, 1, 0.35)
+
+        local hexLabel = Instance.new('TextLabel')
+        hexLabel.BackgroundTransparency = 1
+        hexLabel.AnchorPoint = Vector2.new(1, 0)
+        hexLabel.Position = UDim2.new(1, -60, 0, 0)
+        hexLabel.Size = UDim2.fromOffset(68, 24)
+        hexLabel.Font = Enum.Font.Gotham
+        hexLabel.TextColor3 = palette.textDim
+        hexLabel.TextSize = 11
+        hexLabel.TextXAlignment = Enum.TextXAlignment.Right
+        hexLabel.Text = '#FFFFFF'
+        hexLabel.Parent = headerRow
+
+        local panel = Instance.new('Frame')
+        panel.BackgroundColor3 = palette.surface
+        panel.Size = UDim2.new(1, 0, 0, 0)
+        panel.AutomaticSize = Enum.AutomaticSize.Y
+        panel.ClipsDescendants = true
+        panel.Visible = false
+        panel.Parent = wrap
+        applyCorner(panel, 6)
+        applyStroke(panel, palette.strokeSoft, 1, 0.5)
+
+        local panelBaseTransparency = panel.BackgroundTransparency
+
+        local function showPanel()
+            panel.Visible = true
+            panel.BackgroundTransparency = 1
+            tween(panel, 0.14, { BackgroundTransparency = panelBaseTransparency })
+        end
+
+        local function hidePanel()
+            tween(panel, 0.12, { BackgroundTransparency = 1 })
+            runLater(0.13, function()
+                panel.Visible = false
+                panel.BackgroundTransparency = panelBaseTransparency
+            end)
+        end
+
+        local panelPad = Instance.new('UIPadding')
+        panelPad.PaddingTop = UDim.new(0, 8)
+        panelPad.PaddingBottom = UDim.new(0, 8)
+        panelPad.PaddingLeft = UDim.new(0, 8)
+        panelPad.PaddingRight = UDim.new(0, 8)
+        panelPad.Parent = panel
+
+        local panelLayout = Instance.new('UIListLayout')
+        panelLayout.Padding = UDim.new(0, 8)
+        panelLayout.Parent = panel
+
+        local pickerRow = Instance.new('Frame')
+        pickerRow.BackgroundTransparency = 1
+        pickerRow.Size = UDim2.new(1, 0, 0, 168)
+        pickerRow.Parent = panel
+
+        local wheelWrap = Instance.new('Frame')
+        wheelWrap.BackgroundColor3 = palette.surfaceSoft
+        wheelWrap.Position = UDim2.fromOffset(0, 0)
+        wheelWrap.Size = UDim2.fromOffset(168, 168)
+        wheelWrap.Parent = pickerRow
+        applyCorner(wheelWrap, 8)
+
+        local wheelImage = Instance.new('ImageLabel')
+        wheelImage.BackgroundTransparency = 1
+        wheelImage.Position = UDim2.fromOffset(6, 6)
+        wheelImage.Size = UDim2.fromOffset(156, 156)
+        wheelImage.Image = 'rbxassetid://6020299385'
+        wheelImage.ScaleType = Enum.ScaleType.Stretch
+        wheelImage.Parent = wheelWrap
+
+        local wheelCursor = Instance.new('Frame')
+        wheelCursor.AnchorPoint = Vector2.new(0.5, 0.5)
+        wheelCursor.Size = UDim2.fromOffset(16, 16)
+        wheelCursor.BackgroundColor3 = Color3.new(0, 0, 0)
+        wheelCursor.BackgroundTransparency = 0.25
+        wheelCursor.Parent = wheelImage
+        applyCorner(wheelCursor, 8)
+        applyStroke(wheelCursor, Color3.fromRGB(235, 240, 250), 2, 0)
+
+        local valueWrap = Instance.new('Frame')
+        valueWrap.BackgroundColor3 = palette.surfaceSoft
+        valueWrap.AnchorPoint = Vector2.new(1, 0)
+        valueWrap.Position = UDim2.new(1, 0, 0, 0)
+        valueWrap.Size = UDim2.fromOffset(26, 168)
+        valueWrap.Parent = pickerRow
+        applyCorner(valueWrap, 8)
+
+        local valueBar = Instance.new('Frame')
+        valueBar.BackgroundColor3 = Color3.new(1, 1, 1)
+        valueBar.Position = UDim2.fromOffset(6, 6)
+        valueBar.Size = UDim2.fromOffset(14, 156)
+        valueBar.Parent = valueWrap
+        applyCorner(valueBar, 6)
+
+        local valueGradient = Instance.new('UIGradient')
+        valueGradient.Rotation = 90
+        valueGradient.Parent = valueBar
+
+        local valueKnob = Instance.new('Frame')
+        valueKnob.AnchorPoint = Vector2.new(0.5, 0.5)
+        valueKnob.Size = UDim2.fromOffset(24, 6)
+        valueKnob.Position = UDim2.new(0.5, 0, 0, 6)
+        valueKnob.BackgroundColor3 = Color3.fromRGB(245, 247, 252)
+        valueKnob.Parent = valueWrap
+        applyCorner(valueKnob, 3)
+        applyStroke(valueKnob, Color3.fromRGB(50, 60, 80), 1, 0.2)
+
+        local function layoutPicker()
+            local availableWidth = pickerRow.AbsoluteSize.X
+            if availableWidth <= 0 then
+                availableWidth = 200
+            end
+
+            local sliderWidth = 26
+            local gap = 8
+            local wheelOuter = availableWidth - sliderWidth - gap
+            wheelOuter = math.clamp(wheelOuter, 96, 212)
+
+            pickerRow.Size = UDim2.new(1, 0, 0, wheelOuter)
+            wheelWrap.Size = UDim2.fromOffset(wheelOuter, wheelOuter)
+            wheelWrap.Position = UDim2.fromOffset(0, 0)
+
+            local wheelInner = math.max(24, wheelOuter - 12)
+            local wheelInset = math.floor((wheelOuter - wheelInner) / 2)
+            wheelImage.Position = UDim2.fromOffset(wheelInset, wheelInset)
+            wheelImage.Size = UDim2.fromOffset(wheelInner, wheelInner)
+
+            valueWrap.Size = UDim2.fromOffset(sliderWidth, wheelOuter)
+            valueWrap.Position = UDim2.new(1, 0, 0, 0)
+
+            local valueBarHeight = math.max(24, wheelOuter - 12)
+            local valueBarOffset = math.floor((wheelOuter - valueBarHeight) / 2)
+            valueBar.Position = UDim2.fromOffset(6, valueBarOffset)
+            valueBar.Size = UDim2.fromOffset(14, valueBarHeight)
+        end
+
+        local controlsRow = Instance.new('Frame')
+        controlsRow.BackgroundTransparency = 1
+        controlsRow.Size = UDim2.new(1, 0, 0, 34)
+        controlsRow.Parent = panel
+
+        local preview = Instance.new('Frame')
+        preview.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+        preview.Size = UDim2.fromOffset(34, 34)
+        preview.Parent = controlsRow
+        applyCorner(preview, 10)
+
+        local okBtn = Instance.new('TextButton')
+        okBtn.AutoButtonColor = false
+        okBtn.Position = UDim2.fromOffset(42, 0)
+        okBtn.Size = UDim2.fromOffset(34, 34)
+        okBtn.BackgroundColor3 = palette.surfaceSoft
+        okBtn.Font = Enum.Font.GothamBold
+        okBtn.TextSize = 18
+        okBtn.TextColor3 = palette.text
+        okBtn.Text = 'OK'
+        okBtn.Parent = controlsRow
+        applyCorner(okBtn, 8)
+
+        local cancelBtn = Instance.new('TextButton')
+        cancelBtn.AutoButtonColor = false
+        cancelBtn.Position = UDim2.fromOffset(82, 0)
+        cancelBtn.Size = UDim2.fromOffset(34, 34)
+        cancelBtn.BackgroundColor3 = palette.surfaceSoft
+        cancelBtn.Font = Enum.Font.GothamBold
+        cancelBtn.TextSize = 18
+        cancelBtn.TextColor3 = palette.text
+        cancelBtn.Text = 'X'
+        cancelBtn.Parent = controlsRow
+        applyCorner(cancelBtn, 8)
+
+        local hexBox = Instance.new('TextBox')
+        hexBox.BackgroundColor3 = palette.surfaceSoft
+        hexBox.AnchorPoint = Vector2.new(1, 0)
+        hexBox.Position = UDim2.new(1, 0, 0, 0)
+        hexBox.Size = UDim2.fromOffset(142, 34)
+        hexBox.Font = Enum.Font.GothamSemibold
+        hexBox.TextColor3 = palette.text
+        hexBox.TextSize = 12
+        hexBox.ClearTextOnFocus = false
+        hexBox.Text = '#FFFFFF'
+        hexBox.Parent = controlsRow
+        applyCorner(hexBox, 8)
+
+        local valuesWrap = Instance.new('Frame')
+        valuesWrap.BackgroundColor3 = palette.surfaceSoft
+        valuesWrap.Size = UDim2.new(1, 0, 0, 78)
+        valuesWrap.Parent = panel
+        applyCorner(valuesWrap, 8)
+
+        local valuesPad = Instance.new('UIPadding')
+        valuesPad.PaddingTop = UDim.new(0, 6)
+        valuesPad.PaddingBottom = UDim.new(0, 6)
+        valuesPad.PaddingLeft = UDim.new(0, 8)
+        valuesPad.PaddingRight = UDim.new(0, 8)
+        valuesPad.Parent = valuesWrap
+
+        local valuesStack = Instance.new('UIListLayout')
+        valuesStack.Padding = UDim.new(0, 6)
+        valuesStack.Parent = valuesWrap
+
+        local function createValueLine(keys)
+            local line = Instance.new('Frame')
+            line.BackgroundTransparency = 1
+            line.Size = UDim2.new(1, 0, 0, 30)
+            line.Parent = valuesWrap
+
+            local lineList = Instance.new('UIListLayout')
+            lineList.FillDirection = Enum.FillDirection.Horizontal
+            lineList.Padding = UDim.new(0, 8)
+            lineList.Parent = line
+
+            local fields = {}
+            for _, item in ipairs(keys) do
+                local chunk = Instance.new('Frame')
+                chunk.BackgroundTransparency = 1
+                chunk.Size = UDim2.new(1 / 3, -6, 1, 0)
+                chunk.Parent = line
+
+                local keyLabel = Instance.new('TextLabel')
+                keyLabel.BackgroundTransparency = 1
+                keyLabel.Position = UDim2.fromOffset(0, 0)
+                keyLabel.Size = UDim2.fromOffset(14, 30)
+                keyLabel.Font = Enum.Font.GothamSemibold
+                keyLabel.TextColor3 = palette.text
+                keyLabel.TextSize = 12
+                keyLabel.TextXAlignment = Enum.TextXAlignment.Left
+                keyLabel.Text = item
+                keyLabel.Parent = chunk
+
+                local keyBox = Instance.new('TextBox')
+                keyBox.BackgroundColor3 = palette.surfaceElevated
+                keyBox.Position = UDim2.fromOffset(18, 0)
+                keyBox.Size = UDim2.new(1, -18, 1, 0)
+                keyBox.Font = Enum.Font.Gotham
+                keyBox.TextColor3 = palette.text
+                keyBox.TextSize = 12
+                keyBox.ClearTextOnFocus = false
+                keyBox.Text = '0'
+                keyBox.Parent = chunk
+                applyCorner(keyBox, 7)
+
+                fields[item] = keyBox
+            end
+            return fields
+        end
+
+        local rgbFields = createValueLine({ 'R', 'G', 'B' })
+        local hsvFields = createValueLine({ 'H', 'S', 'V' })
+
+        local committedColor = typeof(optionObj.Value) == 'Color3' and optionObj.Value or Color3.fromRGB(255, 255, 255)
+        local hue, sat, val = committedColor:ToHSV()
+        local suppressExternal = false
+        local dragMode = nil
+
+        local function getCurrentColor()
+            return Color3.fromHSV(hue, sat, val)
+        end
+
+        local function updateSelectors()
+            local radius = math.min(wheelImage.AbsoluteSize.X, wheelImage.AbsoluteSize.Y) / 2
+            if radius <= 0 then
+                return
+            end
+            local centerX = wheelImage.AbsoluteSize.X / 2
+            local centerY = wheelImage.AbsoluteSize.Y / 2
+            local angle = (hue - 0.5) * 2 * math.pi
+            local dist = sat * radius
+            local x = centerX + math.cos(angle) * dist
+            local y = centerY + math.sin(angle) * dist
+            wheelCursor.Position = UDim2.fromOffset(x, y)
+
+            local yPct = 1 - val
+            local barOffset = valueBar.Position.Y.Offset
+            local barHeight = valueBar.AbsoluteSize.Y
+            valueKnob.Position = UDim2.new(0.5, 0, 0, barOffset + (barHeight * yPct))
+
+            local topColor = Color3.fromHSV(hue, sat, 1)
+            valueGradient.Color = ColorSequence.new({
+                ColorSequenceKeypoint.new(0, topColor),
+                ColorSequenceKeypoint.new(1, Color3.new(0, 0, 0))
+            })
+        end
+
+        local function syncFields()
+            local c = getCurrentColor()
+            local rgb = colorToRGB(c)
+            if not rgbFields.R:IsFocused() then rgbFields.R.Text = tostring(rgb.r) end
+            if not rgbFields.G:IsFocused() then rgbFields.G.Text = tostring(rgb.g) end
+            if not rgbFields.B:IsFocused() then rgbFields.B.Text = tostring(rgb.b) end
+            if not hsvFields.H:IsFocused() then hsvFields.H.Text = tostring(math.floor((hue * 360) + 0.5)) end
+            if not hsvFields.S:IsFocused() then hsvFields.S.Text = string.format('%.2f', sat) end
+            if not hsvFields.V:IsFocused() then hsvFields.V.Text = string.format('%.2f', val) end
+            if not hexBox:IsFocused() then hexBox.Text = colorToHex(c) end
+            colorButton.BackgroundColor3 = c
+            preview.BackgroundColor3 = c
+            hexLabel.Text = colorToHex(c)
+        end
+
+        local function pushOption()
+            suppressExternal = true
+            optionObj:SetValue(getCurrentColor())
+            suppressExternal = false
+        end
+
+        local function render(push)
+            updateSelectors()
+            syncFields()
+            if push then
+                pushOption()
+            end
+        end
+
+        local function setFromColor(color, push)
+            local c = typeof(color) == 'Color3' and color or Color3.fromRGB(255, 255, 255)
+            hue, sat, val = c:ToHSV()
+            render(push)
+        end
+
+        local function setFromWheel(px, py)
+            local centerX = wheelImage.AbsolutePosition.X + (wheelImage.AbsoluteSize.X / 2)
+            local centerY = wheelImage.AbsolutePosition.Y + (wheelImage.AbsoluteSize.Y / 2)
+            local radius = math.min(wheelImage.AbsoluteSize.X, wheelImage.AbsoluteSize.Y) / 2
+            if radius <= 0 then
+                return
+            end
+            local dx = px - centerX
+            local dy = py - centerY
+            local dist = math.sqrt((dx * dx) + (dy * dy))
+            if dist > radius and dist > 0 then
+                local m = radius / dist
+                dx = dx * m
+                dy = dy * m
+                dist = radius
+            end
+            sat = math.clamp(dist / radius, 0, 1)
+            if sat > 0 then
+                hue = (math.atan2(dy, dx) / (2 * math.pi) + 0.5) % 1
+            end
+            render(true)
+        end
+
+        local function setFromValue(py)
+            local top = valueBar.AbsolutePosition.Y
+            local size = valueBar.AbsoluteSize.Y
+            local pct = 0
+            if size > 0 then
+                pct = math.clamp((py - top) / size, 0, 1)
+            end
+            val = 1 - pct
+            render(true)
+        end
+
+safeConnect(wheelImage.InputBegan, function(input)
+            if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+                dragMode = 'wheel'
+                setFromWheel(input.Position.X, input.Position.Y)
+            end
+        end)
+safeConnect(wheelImage.InputChanged, function(input)
+            if dragMode == 'wheel' and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+                setFromWheel(input.Position.X, input.Position.Y)
+            end
+        end)
+safeConnect(wheelImage.InputEnded, function(input)
+            if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+                dragMode = nil
+            end
+        end)
+
+safeConnect(valueBar.InputBegan, function(input)
+            if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+                dragMode = 'value'
+                setFromValue(input.Position.Y)
+            end
+        end)
+safeConnect(valueBar.InputChanged, function(input)
+            if dragMode == 'value' and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+                setFromValue(input.Position.Y)
+            end
+        end)
+safeConnect(valueBar.InputEnded, function(input)
+            if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+                dragMode = nil
+            end
+        end)
+
+safeConnect(rgbFields.R.FocusLost, function()
+            local r = math.clamp(math.floor((tonumber(rgbFields.R.Text) or 0) + 0.5), 0, 255)
+            local g = math.clamp(math.floor((tonumber(rgbFields.G.Text) or 0) + 0.5), 0, 255)
+            local b = math.clamp(math.floor((tonumber(rgbFields.B.Text) or 0) + 0.5), 0, 255)
+            setFromColor(Color3.fromRGB(r, g, b), true)
+        end)
+safeConnect(rgbFields.G.FocusLost, function()
+            local r = math.clamp(math.floor((tonumber(rgbFields.R.Text) or 0) + 0.5), 0, 255)
+            local g = math.clamp(math.floor((tonumber(rgbFields.G.Text) or 0) + 0.5), 0, 255)
+            local b = math.clamp(math.floor((tonumber(rgbFields.B.Text) or 0) + 0.5), 0, 255)
+            setFromColor(Color3.fromRGB(r, g, b), true)
+        end)
+safeConnect(rgbFields.B.FocusLost, function()
+            local r = math.clamp(math.floor((tonumber(rgbFields.R.Text) or 0) + 0.5), 0, 255)
+            local g = math.clamp(math.floor((tonumber(rgbFields.G.Text) or 0) + 0.5), 0, 255)
+            local b = math.clamp(math.floor((tonumber(rgbFields.B.Text) or 0) + 0.5), 0, 255)
+            setFromColor(Color3.fromRGB(r, g, b), true)
+        end)
+
+safeConnect(hsvFields.H.FocusLost, function()
+            local hNum = tonumber(hsvFields.H.Text) or (hue * 360)
+            local sNum = tonumber(hsvFields.S.Text) or sat
+            local vNum = tonumber(hsvFields.V.Text) or val
+            hue = (hNum % 360) / 360
+            sat = math.clamp(sNum, 0, 1)
+            val = math.clamp(vNum, 0, 1)
+            render(true)
+        end)
+safeConnect(hsvFields.S.FocusLost, function()
+            local hNum = tonumber(hsvFields.H.Text) or (hue * 360)
+            local sNum = tonumber(hsvFields.S.Text) or sat
+            local vNum = tonumber(hsvFields.V.Text) or val
+            hue = (hNum % 360) / 360
+            sat = math.clamp(sNum, 0, 1)
+            val = math.clamp(vNum, 0, 1)
+            render(true)
+        end)
+safeConnect(hsvFields.V.FocusLost, function()
+            local hNum = tonumber(hsvFields.H.Text) or (hue * 360)
+            local sNum = tonumber(hsvFields.S.Text) or sat
+            local vNum = tonumber(hsvFields.V.Text) or val
+            hue = (hNum % 360) / 360
+            sat = math.clamp(sNum, 0, 1)
+            val = math.clamp(vNum, 0, 1)
+            render(true)
+        end)
+
+        local function applyHex()
+            local parsed = hexToColor(hexBox.Text)
+            if parsed then
+                setFromColor(parsed, true)
+            else
+                hexBox.Text = colorToHex(getCurrentColor())
+            end
+        end
+safeConnect(hexBox.FocusLost, function(enterPressed)
+            if enterPressed then
+                applyHex()
+            end
+        end)
+
+safeConnect(okBtn.MouseButton1Click, function()
+            committedColor = getCurrentColor()
+            hidePanel()
+            if activeColorPanel == panel then
+                activeColorPanel = nil
+            end
+        end)
+safeConnect(cancelBtn.MouseButton1Click, function()
+            setFromColor(committedColor, true)
+            hidePanel()
+            if activeColorPanel == panel then
+                activeColorPanel = nil
+            end
+        end)
+safeConnect(colorButton.MouseButton1Click, function()
+            if panel.Visible then
+                hidePanel()
+                if activeColorPanel == panel then
+                    activeColorPanel = nil
+                end
+                return
+            end
+
+            if activeColorPanel and activeColorPanel ~= panel then
+                activeColorPanel.Visible = false
+            end
+
+            setFromColor(optionObj.Value, false)
+            committedColor = typeof(optionObj.Value) == 'Color3' and optionObj.Value or getCurrentColor()
+            showPanel()
+            activeColorPanel = panel
+            task.defer(function()
+                layoutPicker()
+                render(false)
+            end)
+        end)
+
+        attachChangeListener(optionObj, function()
+            if suppressExternal then
+                return
+            end
+            local external = typeof(optionObj.Value) == 'Color3' and optionObj.Value or Color3.fromRGB(255, 255, 255)
+            committedColor = external
+            setFromColor(external, false)
+        end)
+
+safeConnect(pickerRow:GetPropertyChangedSignal('AbsoluteSize'), function()
+            if panel.Visible then
+                layoutPicker()
+                render(false)
+            end
+        end)
+
+        layoutPicker()
+        setFromColor(committedColor, false)
+    end
+
+    local runtimeConnections = {}
+    local function trackConnection(conn)
+        if conn then
+            table.insert(runtimeConnections, conn)
+        end
+        return conn
+    end
+
+    local function getPlayerNamesLive()
+        local raw = {}
+        local displayCounts = {}
+        for _, pl in ipairs(Players:GetPlayers()) do
+            if pl ~= LocalPlayer then
+                local display = tostring(pl.DisplayName or pl.Name)
+                displayCounts[display] = (displayCounts[display] or 0) + 1
+                table.insert(raw, { username = pl.Name, display = display })
+            end
+        end
+
+        local out = {}
+        for _, item in ipairs(raw) do
+            local label = item.display
+            if displayCounts[item.display] and displayCounts[item.display] > 1 then
+                label = string.format('%s (@%s)', item.display, item.username)
+            end
+            table.insert(out, {
+                username = item.username,
+                label = label
+            })
+        end
+
+        table.sort(out, function(a, b)
+            return string.lower(a.label) < string.lower(b.label)
+        end)
+        return out
+    end
+
+    local function createWhitelistDropdown(parent, caption, optionObj)
+        local block = Instance.new('Frame')
+        block.BackgroundColor3 = palette.surfaceElevated
+        block.Size = UDim2.new(1, 0, 0, 44)
+        block.AutomaticSize = Enum.AutomaticSize.Y
+        block.Parent = parent
+        applyCorner(block, 6)
+        addHover(block, palette.surfaceElevated, palette.surfaceSoft)
+
+        local pad = Instance.new('UIPadding')
+        pad.PaddingTop = UDim.new(0, 8)
+        pad.PaddingBottom = UDim.new(0, 8)
+        pad.PaddingLeft = UDim.new(0, 8)
+        pad.PaddingRight = UDim.new(0, 8)
+        pad.Parent = block
+
+        local list = Instance.new('UIListLayout')
+        list.Padding = UDim.new(0, 6)
+        list.Parent = block
+
+        local dropdownBtn = Instance.new('TextButton')
+        dropdownBtn.AutoButtonColor = false
+        dropdownBtn.BackgroundColor3 = palette.surface
+        dropdownBtn.Size = UDim2.new(1, 0, 0, 28)
+        dropdownBtn.Font = Enum.Font.GothamSemibold
+        dropdownBtn.TextColor3 = palette.text
+        dropdownBtn.TextSize = 12
+        dropdownBtn.TextXAlignment = Enum.TextXAlignment.Left
+        dropdownBtn.Text = '  ' .. caption
+        dropdownBtn.Parent = block
+        applyCorner(dropdownBtn, 8)
+        applyStroke(dropdownBtn, palette.stroke, 1, 0.6)
+        addHover(dropdownBtn, palette.surface, palette.surfaceSoft)
+
+        local listFrame = Instance.new('Frame')
+        listFrame.BackgroundColor3 = palette.surface
+        listFrame.Size = UDim2.new(1, 0, 0, 0)
+        listFrame.AutomaticSize = Enum.AutomaticSize.Y
+        listFrame.Visible = false
+        listFrame.Parent = block
+        applyCorner(listFrame, 8)
+        local listStroke = applyStroke(listFrame, palette.stroke, 1, 0.6)
+        local listBaseTransparency = listFrame.BackgroundTransparency
+        local listStrokeBaseTransparency = listStroke.Transparency
+
+        local listPad = Instance.new('UIPadding')
+        listPad.PaddingTop = UDim.new(0, 6)
+        listPad.PaddingBottom = UDim.new(0, 6)
+        listPad.PaddingLeft = UDim.new(0, 6)
+        listPad.PaddingRight = UDim.new(0, 6)
+        listPad.Parent = listFrame
+
+        local listLayout = Instance.new('UIListLayout')
+        listLayout.Padding = UDim.new(0, 4)
+        listLayout.Parent = listFrame
+
+        local selected = normalizeSelection(optionObj.Value)
+        local opened = false
+        local rows = {}
+
+        local function getListHeight()
+            local padH = listPad.PaddingTop.Offset + listPad.PaddingBottom.Offset
+            local contentH = listLayout.AbsoluteContentSize.Y
+            return math.max(0, contentH + padH)
+        end
+
+        local function syncListHeight(instant)
+            if not opened then
+                return
+            end
+            local h = getListHeight()
+            local size = UDim2.new(1, 0, 0, h)
+            if instant then
+                listFrame.Size = size
+            else
+                tween(listFrame, 0.14, { Size = size })
+            end
+        end
+
+        local function showList()
+            opened = true
+            listFrame.Visible = true
+            listFrame.AutomaticSize = Enum.AutomaticSize.None
+            listFrame.Size = UDim2.new(1, 0, 0, 0)
+            listFrame.BackgroundTransparency = 1
+            listStroke.Transparency = 1
+            tween(listFrame, 0.14, { BackgroundTransparency = listBaseTransparency })
+            tween(listStroke, 0.14, { Transparency = listStrokeBaseTransparency })
+            runLater(0, function()
+                syncListHeight(false)
+            end)
+        end
+
+        local function hideList()
+            opened = false
+            tween(listFrame, 0.12, { Size = UDim2.new(1, 0, 0, 0) })
+            tween(listFrame, 0.12, { BackgroundTransparency = 1 })
+            tween(listStroke, 0.12, { Transparency = 1 })
+            runLater(0.13, function()
+                listFrame.Visible = false
+                listFrame.BackgroundTransparency = listBaseTransparency
+                listStroke.Transparency = listStrokeBaseTransparency
+                listFrame.AutomaticSize = Enum.AutomaticSize.Y
+            end)
+        end
+
+        local function selectedCount()
+            local count = 0
+            for _, state in pairs(selected) do
+                if state then
+                    count = count + 1
+                end
+            end
+            return count
+        end
+
+        local function updateHeader()
+            local count = selectedCount()
+            if count > 0 then
+                dropdownBtn.Text = string.format('  %s (%d)', caption, count)
+            else
+                dropdownBtn.Text = string.format('  %s (none)', caption)
+            end
+        end
+
+        local function setSelectedAndSync(newMap)
+            selected = newMap
+            optionObj:SetValue(newMap)
+            updateHeader()
+            for _, row in ipairs(rows) do
+                local on = selected[row.key] == true
+                row.check.BackgroundColor3 = on and palette.accent or palette.surfaceElevated
+                row.nameLabel.TextColor3 = on and palette.text or palette.textDim
+            end
+        end
+
+        local function clearRows()
+            for _, row in ipairs(rows) do
+                if row.button then
+                    row.button:Destroy()
+                end
+            end
+            rows = {}
+        end
+
+        local function refreshRows()
+            clearRows()
+            local entries = getPlayerNamesLive()
+            local valid = {}
+            for _, entry in ipairs(entries) do
+                valid[entry.username] = true
+            end
+
+            local changed = false
+            for name, state in pairs(selected) do
+                if state and not valid[name] then
+                    selected[name] = nil
+                    changed = true
+                end
+            end
+            if changed then
+                optionObj:SetValue(selected)
+            end
+
+            if #entries == 0 then
+                local empty = Instance.new('TextLabel')
+                empty.BackgroundTransparency = 1
+                empty.Size = UDim2.new(1, 0, 0, 20)
+                empty.Font = Enum.Font.Gotham
+                empty.TextColor3 = palette.textDim
+                empty.TextSize = 11
+                empty.TextXAlignment = Enum.TextXAlignment.Left
+                empty.Text = 'No other players in server'
+                empty.Parent = listFrame
+                rows[1] = {
+                    button = empty,
+                    key = '__empty__',
+                    check = { BackgroundColor3 = palette.surface },
+                    nameLabel = empty
+                }
+                updateHeader()
+                return
+            end
+
+            for _, entry in ipairs(entries) do
+                local rowBtn = Instance.new('TextButton')
+                rowBtn.AutoButtonColor = false
+                rowBtn.BackgroundColor3 = palette.surfaceSoft
+                rowBtn.Size = UDim2.new(1, 0, 0, 26)
+                rowBtn.Text = ''
+                rowBtn.Parent = listFrame
+                applyCorner(rowBtn, 7)
+
+                local check = Instance.new('Frame')
+                check.Size = UDim2.fromOffset(14, 14)
+                check.Position = UDim2.new(0, 6, 0.5, -7)
+                check.BackgroundColor3 = palette.surfaceElevated
+                check.Parent = rowBtn
+                applyCorner(check, 4)
+        applyStroke(check, palette.strokeSoft, 1, 0.45)
+
+                local nameLabel = Instance.new('TextLabel')
+                nameLabel.BackgroundTransparency = 1
+                nameLabel.Position = UDim2.fromOffset(28, 0)
+                nameLabel.Size = UDim2.new(1, -30, 1, 0)
+                nameLabel.Font = Enum.Font.Gotham
+                nameLabel.TextSize = 12
+                nameLabel.TextXAlignment = Enum.TextXAlignment.Left
+                nameLabel.Text = entry.label
+                nameLabel.Parent = rowBtn
+
+                local rowEntry = {
+                    button = rowBtn,
+                    key = entry.username,
+                    check = check,
+                    nameLabel = nameLabel,
+                }
+                table.insert(rows, rowEntry)
+
+                local function renderRow()
+                    local on = selected[entry.username] == true
+                    check.BackgroundColor3 = on and palette.accent or palette.surfaceElevated
+                    nameLabel.TextColor3 = on and palette.text or palette.textDim
+                end
+
+safeConnect(rowBtn.MouseButton1Click, function()
+                    local newMap = normalizeSelection(selected)
+                    if newMap[entry.username] then
+                        newMap[entry.username] = nil
+                    else
+                        newMap[entry.username] = true
+                    end
+                    setSelectedAndSync(newMap)
+                end)
+
+                renderRow()
+            end
+
+            updateHeader()
+            if opened then
+                runLater(0, function()
+                    syncListHeight(false)
+                end)
+            end
+        end
+
+safeConnect(dropdownBtn.MouseButton1Click, function()
+            if opened then
+                hideList()
+            else
+                showList()
+            end
+            updateHeader()
+        end)
+
+        attachChangeListener(optionObj, function()
+            selected = normalizeSelection(optionObj.Value)
+            refreshRows()
+        end)
+
+        safeConnect(listLayout:GetPropertyChangedSignal('AbsoluteContentSize'), function()
+            if opened then
+                syncListHeight(false)
+            end
+        end)
+
+trackConnection(safeConnect(Players.PlayerAdded, function()
+            refreshRows()
+        end))
+trackConnection(safeConnect(Players.PlayerRemoving, function()
+            refreshRows()
+        end))
+
+        refreshRows()
+        updateHeader()
+    end
+
+    local function createSinglePlayerDropdown(parent, caption, optionObj)
+        local block = Instance.new('Frame')
+        block.BackgroundColor3 = palette.surfaceElevated
+        block.Size = UDim2.new(1, 0, 0, 44)
+        block.AutomaticSize = Enum.AutomaticSize.Y
+        block.Parent = parent
+        applyCorner(block, 6)
+        addHover(block, palette.surfaceElevated, palette.surfaceSoft)
+
+        local pad = Instance.new('UIPadding')
+        pad.PaddingTop = UDim.new(0, 8)
+        pad.PaddingBottom = UDim.new(0, 8)
+        pad.PaddingLeft = UDim.new(0, 8)
+        pad.PaddingRight = UDim.new(0, 8)
+        pad.Parent = block
+
+        local list = Instance.new('UIListLayout')
+        list.Padding = UDim.new(0, 6)
+        list.Parent = block
+
+        local dropdownBtn = Instance.new('TextButton')
+        dropdownBtn.AutoButtonColor = false
+        dropdownBtn.BackgroundColor3 = palette.surface
+        dropdownBtn.Size = UDim2.new(1, 0, 0, 28)
+        dropdownBtn.Font = Enum.Font.GothamSemibold
+        dropdownBtn.TextColor3 = palette.text
+        dropdownBtn.TextSize = 12
+        dropdownBtn.TextXAlignment = Enum.TextXAlignment.Left
+        dropdownBtn.Text = '  ' .. caption
+        dropdownBtn.Parent = block
+        applyCorner(dropdownBtn, 8)
+        applyStroke(dropdownBtn, palette.stroke, 1, 0.6)
+        addHover(dropdownBtn, palette.surface, palette.surfaceSoft)
+
+        local listFrame = Instance.new('Frame')
+        listFrame.BackgroundColor3 = palette.surface
+        listFrame.Size = UDim2.new(1, 0, 0, 0)
+        listFrame.AutomaticSize = Enum.AutomaticSize.Y
+        listFrame.Visible = false
+        listFrame.Parent = block
+        applyCorner(listFrame, 8)
+        local listStroke = applyStroke(listFrame, palette.stroke, 1, 0.6)
+        local listBaseTransparency = listFrame.BackgroundTransparency
+        local listStrokeBaseTransparency = listStroke.Transparency
+
+        local listPad = Instance.new('UIPadding')
+        listPad.PaddingTop = UDim.new(0, 6)
+        listPad.PaddingBottom = UDim.new(0, 6)
+        listPad.PaddingLeft = UDim.new(0, 6)
+        listPad.PaddingRight = UDim.new(0, 6)
+        listPad.Parent = listFrame
+
+        local listLayout = Instance.new('UIListLayout')
+        listLayout.Padding = UDim.new(0, 4)
+        listLayout.Parent = listFrame
+
+        local selected = type(optionObj.Value) == 'string' and optionObj.Value or ''
+        local opened = false
+        local rows = {}
+        local selectedLabel = ''
+
+        local function getListHeight()
+            local padH = listPad.PaddingTop.Offset + listPad.PaddingBottom.Offset
+            local contentH = listLayout.AbsoluteContentSize.Y
+            return math.max(0, contentH + padH)
+        end
+
+        local function syncListHeight(instant)
+            if not opened then
+                return
+            end
+            local h = getListHeight()
+            local size = UDim2.new(1, 0, 0, h)
+            if instant then
+                listFrame.Size = size
+            else
+                tween(listFrame, 0.14, { Size = size })
+            end
+        end
+
+        local function showList()
+            opened = true
+            listFrame.Visible = true
+            listFrame.AutomaticSize = Enum.AutomaticSize.None
+            listFrame.Size = UDim2.new(1, 0, 0, 0)
+            listFrame.BackgroundTransparency = 1
+            listStroke.Transparency = 1
+            tween(listFrame, 0.14, { BackgroundTransparency = listBaseTransparency })
+            tween(listStroke, 0.14, { Transparency = listStrokeBaseTransparency })
+            runLater(0, function()
+                syncListHeight(false)
+            end)
+        end
+
+        local function hideList()
+            opened = false
+            tween(listFrame, 0.12, { Size = UDim2.new(1, 0, 0, 0) })
+            tween(listFrame, 0.12, { BackgroundTransparency = 1 })
+            tween(listStroke, 0.12, { Transparency = 1 })
+            runLater(0.13, function()
+                listFrame.Visible = false
+                listFrame.BackgroundTransparency = listBaseTransparency
+                listStroke.Transparency = listStrokeBaseTransparency
+                listFrame.AutomaticSize = Enum.AutomaticSize.Y
+            end)
+        end
+
+        local function updateHeader()
+            if selected ~= '' then
+                dropdownBtn.Text = string.format('  %s (%s)', caption, selectedLabel ~= '' and selectedLabel or selected)
+            else
+                dropdownBtn.Text = string.format('  %s (none)', caption)
+            end
+        end
+
+        local function clearRows()
+            for _, row in ipairs(rows) do
+                if row.button then
+                    row.button:Destroy()
+                end
+            end
+            rows = {}
+        end
+
+        local function refreshRows()
+            clearRows()
+            local entries = getPlayerNamesLive()
+            local selectedStillValid = false
+
+            if #entries == 0 then
+                local empty = Instance.new('TextLabel')
+                empty.BackgroundTransparency = 1
+                empty.Size = UDim2.new(1, 0, 0, 20)
+                empty.Font = Enum.Font.Gotham
+                empty.TextColor3 = palette.textDim
+                empty.TextSize = 11
+                empty.TextXAlignment = Enum.TextXAlignment.Left
+                empty.Text = 'No other players in server'
+                empty.Parent = listFrame
+                rows[1] = {
+                    button = empty,
+                    key = '__empty__',
+                    check = { BackgroundColor3 = palette.surface },
+                    nameLabel = empty
+                }
+                selected = ''
+                selectedLabel = ''
+                pcall(function()
+                    optionObj:SetValue('')
+                end)
+                updateHeader()
+                return
+            end
+
+            for _, entry in ipairs(entries) do
+                if entry.username == selected then
+                    selectedStillValid = true
+                    selectedLabel = entry.label
+                end
+
+                local rowBtn = Instance.new('TextButton')
+                rowBtn.AutoButtonColor = false
+                rowBtn.BackgroundColor3 = palette.surfaceSoft
+                rowBtn.Size = UDim2.new(1, 0, 0, 26)
+                rowBtn.Text = ''
+                rowBtn.Parent = listFrame
+                applyCorner(rowBtn, 7)
+
+                local check = Instance.new('Frame')
+                check.Size = UDim2.fromOffset(14, 14)
+                check.Position = UDim2.new(0, 6, 0.5, -7)
+                check.BackgroundColor3 = palette.surfaceElevated
+                check.Parent = rowBtn
+                applyCorner(check, 4)
+                applyStroke(check, palette.strokeSoft, 1, 0.45)
+
+                local nameLabel = Instance.new('TextLabel')
+                nameLabel.BackgroundTransparency = 1
+                nameLabel.Position = UDim2.fromOffset(28, 0)
+                nameLabel.Size = UDim2.new(1, -30, 1, 0)
+                nameLabel.Font = Enum.Font.Gotham
+                nameLabel.TextSize = 12
+                nameLabel.TextXAlignment = Enum.TextXAlignment.Left
+                nameLabel.Text = entry.label
+                nameLabel.Parent = rowBtn
+
+                local rowEntry = {
+                    button = rowBtn,
+                    key = entry.username,
+                    check = check,
+                    nameLabel = nameLabel,
+                    label = entry.label,
+                }
+                table.insert(rows, rowEntry)
+
+                local function renderRow()
+                    local on = selected == entry.username
+                    check.BackgroundColor3 = on and palette.accent or palette.surfaceElevated
+                    nameLabel.TextColor3 = on and palette.text or palette.textDim
+                end
+
+                safeConnect(rowBtn.MouseButton1Click, function()
+                    if selected == entry.username then
+                        selected = ''
+                        selectedLabel = ''
+                    else
+                        selected = entry.username
+                        selectedLabel = entry.label
+                    end
+                    optionObj:SetValue(selected)
+                    updateHeader()
+                    for _, row in ipairs(rows) do
+                        local on = row.key ~= '__empty__' and selected == row.key
+                        row.check.BackgroundColor3 = on and palette.accent or palette.surfaceElevated
+                        row.nameLabel.TextColor3 = on and palette.text or palette.textDim
+                    end
+                end)
+
+                renderRow()
+            end
+
+            if selected ~= '' and not selectedStillValid then
+                selected = ''
+                selectedLabel = ''
+                pcall(function()
+                    optionObj:SetValue('')
+                end)
+            end
+
+            updateHeader()
+            if opened then
+                runLater(0, function()
+                    syncListHeight(false)
+                end)
+            end
+        end
+
+        safeConnect(dropdownBtn.MouseButton1Click, function()
+            if opened then
+                hideList()
+            else
+                showList()
+            end
+            updateHeader()
+        end)
+
+        attachChangeListener(optionObj, function()
+            local value = optionObj.Value
+            if type(value) ~= 'string' then
+                value = ''
+            end
+            selected = value
+            selectedLabel = ''
+            refreshRows()
+        end)
+
+        safeConnect(listLayout:GetPropertyChangedSignal('AbsoluteContentSize'), function()
+            if opened then
+                syncListHeight(false)
+            end
+        end)
+
+        trackConnection(safeConnect(Players.PlayerAdded, function()
+            refreshRows()
+        end))
+        trackConnection(safeConnect(Players.PlayerRemoving, function()
+            refreshRows()
+        end))
+
+        refreshRows()
+        updateHeader()
+    end
+
+    local function createCycleOptionRow(parent, caption, optionObj, values)
+        local row = Instance.new('Frame')
+        row.BackgroundColor3 = palette.surfaceElevated
+        row.Size = UDim2.new(1, 0, 0, 34)
+        row.Parent = parent
+        applyCorner(row, 6)
+        addHover(row, palette.surfaceElevated, palette.surfaceSoft)
+
+        local label = Instance.new('TextLabel')
+        label.BackgroundTransparency = 1
+        label.Position = UDim2.fromOffset(10, 0)
+        label.Size = UDim2.new(1, -150, 1, 0)
+        label.Font = Enum.Font.GothamSemibold
+        label.TextColor3 = palette.text
+        label.TextSize = 12
+        label.TextXAlignment = Enum.TextXAlignment.Left
+        label.Text = caption
+        label.Parent = row
+
+        local button = Instance.new('TextButton')
+        button.AutoButtonColor = false
+        button.AnchorPoint = Vector2.new(1, 0.5)
+        button.Position = UDim2.new(1, -8, 0.5, 0)
+        button.Size = UDim2.fromOffset(130, 24)
+        button.BackgroundColor3 = palette.surface
+        button.Font = Enum.Font.Gotham
+        button.TextColor3 = palette.text
+        button.TextSize = 11
+        button.Parent = row
+        applyCorner(button, 5)
+        applyStroke(button, palette.strokeSoft, 1, 0.45)
+
+        local function currentIndex()
+            local current = type(optionObj.Value) == 'string' and optionObj.Value or tostring(values[1] or '')
+            for i, v in ipairs(values) do
+                if tostring(v) == current then
+                    return i
+                end
+            end
+            return 1
+        end
+
+        local function render()
+            local idx = currentIndex()
+            button.Text = tostring(values[idx] or '')
+        end
+
+        safeConnect(button.MouseButton1Click, function()
+            local idx = currentIndex() + 1
+            if idx > #values then
+                idx = 1
+            end
+            optionObj:SetValue(tostring(values[idx]))
+            render()
+        end)
+
+        attachChangeListener(optionObj, function()
+            render()
+        end)
+
+        render()
+    end
+
+    local keybindCapture = nil
+    local function beginCapture(optionObj, button)
+        keybindCapture = {
+            option = optionObj,
+            button = button,
+            startedAt = os.clock()
+        }
+        button.Text = 'Press key...'
+    end
+
+    local function createKeybindRow(parent, caption, optionObj)
+        local row = Instance.new('Frame')
+        row.BackgroundColor3 = palette.surfaceElevated
+        row.Size = UDim2.new(1, 0, 0, 34)
+        row.Parent = parent
+        applyCorner(row, 6)
+        addHover(row, palette.surfaceElevated, palette.surfaceSoft)
+
+        local label = Instance.new('TextLabel')
+        label.BackgroundTransparency = 1
+        label.Position = UDim2.fromOffset(10, 0)
+        label.Size = UDim2.new(1, -140, 1, 0)
+        label.Font = Enum.Font.GothamSemibold
+        label.TextColor3 = palette.text
+        label.TextSize = 12
+        label.TextXAlignment = Enum.TextXAlignment.Left
+        label.Text = caption
+        label.Parent = row
+
+        local button = Instance.new('TextButton')
+        button.AutoButtonColor = false
+        button.AnchorPoint = Vector2.new(1, 0.5)
+        button.Position = UDim2.new(1, -8, 0.5, 0)
+        button.Size = UDim2.fromOffset(120, 24)
+        button.BackgroundColor3 = palette.surface
+        button.Font = Enum.Font.Gotham
+        button.TextColor3 = palette.text
+        button.TextSize = 11
+        button.Text = keyName(optionObj.Value)
+        button.Parent = row
+        applyCorner(button, 5)
+        applyStroke(button, palette.strokeSoft, 1, 0.45)
+
+        local buttonBase = button.BackgroundColor3
+safeConnect(button.MouseEnter, function()
+            tween(button, 0.12, { BackgroundColor3 = palette.surfaceSoft })
+        end)
+safeConnect(button.MouseLeave, function()
+            tween(button, 0.18, { BackgroundColor3 = buttonBase })
+        end)
+
+        local modeMenu = Instance.new('Frame')
+        modeMenu.Visible = false
+        modeMenu.AnchorPoint = Vector2.new(1, 0)
+        modeMenu.Position = UDim2.new(1, -8, 1, 4)
+        modeMenu.Size = UDim2.fromOffset(120, 78)
+        modeMenu.BackgroundColor3 = palette.surface
+        modeMenu.ZIndex = 20
+        modeMenu.Parent = row
+        applyCorner(modeMenu, 6)
+        applyStroke(modeMenu, palette.strokeSoft, 1, 0.35)
+
+        local modeBaseTransparency = modeMenu.BackgroundTransparency
+
+        local function showModeMenu()
+            modeMenu.Visible = true
+            modeMenu.BackgroundTransparency = 1
+            tween(modeMenu, 0.14, { BackgroundTransparency = modeBaseTransparency })
+        end
+
+        local function hideModeMenu()
+            tween(modeMenu, 0.12, { BackgroundTransparency = 1 })
+            runLater(0.13, function()
+                modeMenu.Visible = false
+                modeMenu.BackgroundTransparency = modeBaseTransparency
+            end)
+        end
+
+        local modePad = Instance.new('UIPadding')
+        modePad.PaddingTop = UDim.new(0, 4)
+        modePad.PaddingBottom = UDim.new(0, 4)
+        modePad.PaddingLeft = UDim.new(0, 4)
+        modePad.PaddingRight = UDim.new(0, 4)
+        modePad.Parent = modeMenu
+
+        local modeLayout = Instance.new('UIListLayout')
+        modeLayout.Padding = UDim.new(0, 4)
+        modeLayout.Parent = modeMenu
+
+        local modeButtons = {}
+
+        local function pointInBounds(guiObject, point)
+            local pos = guiObject.AbsolutePosition
+            local size = guiObject.AbsoluteSize
+            return point.X >= pos.X
+                and point.Y >= pos.Y
+                and point.X <= (pos.X + size.X)
+                and point.Y <= (pos.Y + size.Y)
+        end
+
+        local function refreshModeButtons()
+            local currentMode = normalizeMode(optionObj.__mode)
+            for modeName, modeButton in pairs(modeButtons) do
+                local active = modeName == currentMode
+                modeButton.BackgroundColor3 = active and palette.accent or palette.surfaceElevated
+                modeButton.TextColor3 = active and palette.bg or palette.text
+            end
+        end
+
+        local function applyMode(modeName)
+            if type(optionObj.SetMode) == 'function' then
+                optionObj:SetMode(modeName)
+            else
+                optionObj.__mode = normalizeMode(modeName)
+                optionObj:SetValue(optionObj.Value)
+            end
+            refreshModeButtons()
+            hideModeMenu()
+        end
+
+        for _, modeName in ipairs({ 'Hold', 'Toggle', 'Always' }) do
+            local modeButton = Instance.new('TextButton')
+            modeButton.AutoButtonColor = false
+            modeButton.Size = UDim2.new(1, 0, 0, 20)
+            modeButton.BackgroundColor3 = palette.surfaceElevated
+            modeButton.Font = Enum.Font.GothamSemibold
+            modeButton.TextColor3 = palette.text
+            modeButton.TextSize = 11
+            modeButton.Text = modeName
+            modeButton.ZIndex = 21
+            modeButton.Parent = modeMenu
+            applyCorner(modeButton, 5)
+
+safeConnect(modeButton.MouseButton1Click, function()
+                applyMode(modeName)
+            end)
+
+            modeButtons[modeName] = modeButton
+        end
+
+safeConnect(button.MouseButton1Click, function()
+            hideModeMenu()
+            beginCapture(optionObj, button)
+        end)
+
+safeConnect(button.MouseButton2Click, function()
+            if modeMenu.Visible then
+                hideModeMenu()
+            else
+                showModeMenu()
+                refreshModeButtons()
+            end
+        end)
+
+trackConnection(safeConnect(UIS.InputBegan, function(input)
+            if not modeMenu.Visible then
+                return
+            end
+
+            if input.UserInputType ~= Enum.UserInputType.MouseButton1
+                and input.UserInputType ~= Enum.UserInputType.MouseButton2
+                and input.UserInputType ~= Enum.UserInputType.Touch then
+                return
+            end
+
+            local point = input.Position
+            if pointInBounds(modeMenu, point) or pointInBounds(button, point) then
+                return
+            end
+
+            hideModeMenu()
+        end))
+
+        attachChangeListener(optionObj, function()
+            if keybindCapture and keybindCapture.option == optionObj then
+                return
+            end
+            button.Text = keyName(optionObj.Value)
+            if modeMenu.Visible then
+                refreshModeButtons()
+            end
+        end)
+
+        refreshModeButtons()
+    end
+
+    local CombatPage = createPage()
+    local VisualsPage = createPage()
+    local SettingsPage = createPage()
+
+    do
+        local hitboxSection = createSection(CombatPage, 'Hitbox')
+        createToggle(hitboxSection, 'Enable Hitboxes', HitboxEnable)
+        createToggle(hitboxSection, 'Show Hitbox Outline', HitboxShow)
+        createSlider(hitboxSection, 'Hitbox Size', HitboxSizeSlider, 0, 50, 1, '')
+        createColorRow(hitboxSection, 'Hitbox Color', HitboxColor)
+        createWhitelistDropdown(hitboxSection, 'Hitbox Whitelist', HitboxWhitelist)
+
+        local triggerSection = createSection(CombatPage, 'Trigger Bot')
+        createToggle(triggerSection, 'Enable Trigger Bot', TriggerEnabled)
+        createToggle(triggerSection, 'Through Walls', TriggerThroughWalls)
+        createSlider(triggerSection, 'Trigger Delay (ms)', TriggerDelay, 0, 500, 1, ' ms')
+        createWhitelistDropdown(triggerSection, 'Trigger Whitelist', TriggerWhitelist)
+        createKeybindRow(triggerSection, 'Trigger Bot Keybind', TriggerKey)
+
+        local autoShotSection = createSection(CombatPage, 'Auto-Shot')
+        createToggle(autoShotSection, 'Enable Auto-Shot', AutoShotEnabled)
+        createKeybindRow(autoShotSection, 'Auto-Shot Keybind', AutoShotKey)
+        createToggle(autoShotSection, 'Auto-Shot Quick Select (LeftAlt)', AutoShotQuickSelectEnabled)
+        createCycleOptionRow(autoShotSection, 'Auto-Shot Mode', AutoShotMode, { 'SINGLE', 'BURST' })
+        createSinglePlayerDropdown(autoShotSection, 'Auto-Shot Target', AutoShotTargetPlayer)
+        createSlider(autoShotSection, 'Auto-Shot Min Delay (ms)', AutoShotDelayMin, 0, 500, 1, ' ms')
+        createSlider(autoShotSection, 'Auto-Shot Max Delay (ms)', AutoShotDelayMax, 0, 500, 1, ' ms')
+        
+        local weaponSection = createSection(CombatPage, 'Weapon Helpers')
+        createToggle(weaponSection, 'Auto Rev', AutoRev)
+        createKeybindRow(weaponSection, 'Insta Macro Keybind', InstaKey)
+    end
+
+    do
+        local espSection = createSection(VisualsPage, 'ESP')
+        createToggle(espSection, 'Enable ESP', ESPEnabled)
+        createToggle(espSection, 'ESP Boxes', ESPBoxes)
+        createToggle(espSection, 'ESP Names / Health', ESPNames)
+        createToggle(espSection, 'HP Color by Health', ESPUseHealthColor)
+        createColorRow(espSection, 'ESP Box Color', ESPBoxColor)
+        createColorRow(espSection, 'ESP Name Color', ESPNameColor)
+        createColorRow(espSection, 'ESP HP Color', ESPHPColor)
+    end
+
+    do
+        local settingsSection = createSection(SettingsPage, 'Settings')
+        createToggle(settingsSection, 'Show Keybinds List', ShowKeybindsList)
+    end
+
+    local pages = {
+        Combat = CombatPage,
+        Visuals = VisualsPage,
+        Settings = SettingsPage,
+    }
+
+    local tabButtons = {}
+
+    local function applyTabVisual(entry)
+        if not entry then
+            return
+        end
+        local active = entry.active == true
+        local hovered = entry.hovered == true
+        local bg = active and palette.surfaceSoft or palette.surfaceElevated
+        local textColor = active and palette.accent or (hovered and palette.accentSoft or palette.text)
+        local strokeColor = active and palette.accent or palette.strokeSoft
+        local strokeTransparency = active and 0.15 or (hovered and 0.35 or 0.55)
+        tween(entry.button, 0.16, { BackgroundColor3 = bg, TextColor3 = textColor })
+        tween(entry.stroke, 0.16, { Color = strokeColor, Transparency = strokeTransparency })
+    end
+
+    local function setTab(tabName)
+        for name, page in pairs(pages) do
+            page.root.Visible = (name == tabName)
+        end
+        for name, entry in pairs(tabButtons) do
+            local active = (name == tabName)
+            entry.active = active
+            applyTabVisual(entry)
+        end
+    end
+
+    local menuState = {
+        open = true,
+        animating = false,
+    }
+
+    local function setMenuVisible(show)
+        if menuState.animating then
+            return
+        end
+        if show == menuState.open then
+            return
+        end
+        menuState.animating = true
+
+        local targetSize = mainTargetSize
+        local targetPos = mainTargetPos
+        local closeWidth = math.max(1, math.floor(targetSize.X.Offset * 0.96))
+        local closeHeight = math.max(1, math.floor(targetSize.Y.Offset * 0.96))
+        local closedSize = UDim2.fromOffset(closeWidth, closeHeight)
+        local closedPos = UDim2.new(0.5, -closeWidth / 2, 0.5, -closeHeight / 2)
+
+        screen.Enabled = true
+        if show then
+            main.Visible = true
+            menuGroup.GroupTransparency = 1
+            main.Size = closedSize
+            main.Position = closedPos
+            tween(menuGroup, 0.18, { GroupTransparency = 0 })
+            tween(main, 0.22, { Size = targetSize, Position = targetPos }, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+            runLater(0.24, function()
+                menuState.open = true
+                menuState.animating = false
+            end)
+        else
+            tween(menuGroup, 0.16, { GroupTransparency = 1 })
+            tween(main, 0.18, { Size = closedSize, Position = closedPos }, Enum.EasingStyle.Quad, Enum.EasingDirection.In)
+            runLater(0.19, function()
+                screen.Enabled = false
+                menuState.open = false
+                menuState.animating = false
+            end)
+        end
+    end
+
+    local function createTabButton(name)
+        local btn = Instance.new('TextButton')
+        btn.AutoButtonColor = false
+        btn.Size = UDim2.new(1, 0, 0, 38)
+        btn.BackgroundColor3 = palette.surfaceElevated
+        btn.Font = Enum.Font.GothamSemibold
+        btn.TextSize = 13
+        btn.TextXAlignment = Enum.TextXAlignment.Left
+        btn.TextColor3 = palette.text
+        btn.Text = name
+        btn.Parent = sidebar
+        applyCorner(btn, 9)
+
+        local btnStroke = applyStroke(btn, palette.strokeSoft, 1, 0.55)
+
+        local btnPad = Instance.new('UIPadding')
+        btnPad.PaddingLeft = UDim.new(0, 16)
+        btnPad.Parent = btn
+
+        local entry = {
+            button = btn,
+            stroke = btnStroke,
+            active = false,
+            hovered = false,
+        }
+
+safeConnect(btn.MouseEnter, function()
+            entry.hovered = true
+            applyTabVisual(entry)
+        end)
+
+safeConnect(btn.MouseLeave, function()
+            entry.hovered = false
+            applyTabVisual(entry)
+        end)
+
+safeConnect(btn.MouseButton1Click, function()
+            setTab(name)
+        end)
+        tabButtons[name] = entry
+    end
+
+    createTabButton('Combat')
+    createTabButton('Visuals')
+    createTabButton('Settings')
+    setTab('Combat')
+
+    menuState.open = false
+    setMenuVisible(true)
+
+    local dragging = false
+    local dragInput = nil
+    local dragStart = nil
+    local startPos = nil
+
+safeConnect(header.InputBegan, function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = true
+            dragStart = input.Position
+            startPos = main.Position
+safeConnect(input.Changed, function()
+                if input.UserInputState == Enum.UserInputState.End then
+                    dragging = false
+                end
+            end)
+        end
+    end)
+
+safeConnect(header.InputChanged, function(input)
+        if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
+            dragInput = input
+        end
+    end)
+
+trackConnection(safeConnect(UIS.InputChanged, function(input)
+        if dragging and input == dragInput then
+            local delta = input.Position - dragStart
+            main.Position = UDim2.new(
+                startPos.X.Scale,
+                startPos.X.Offset + delta.X,
+                startPos.Y.Scale,
+                startPos.Y.Offset + delta.Y
+            )
+            mainTargetPos = main.Position
+        end
+    end))
+
+safeConnect(closeBtn.MouseButton1Click, function()
+        setMenuVisible(false)
+    end)
+
+    local function updateKeyStates(input, began)
+        for opt, _ in pairs(KeybindOptions) do
+            local keyVal = opt.__storeMode and { opt.__key, opt.__mode } or opt.__key
+            if keyMatch(input, keyVal) then
+                if began then
+                    opt.__down = true
+                    if opt.__mode == 'Toggle' then
+                        opt.__toggled = not opt.__toggled
+                    end
+                else
+                    opt.__down = false
+                end
+            end
+        end
+    end
+
+    local function extractBindableInput(input)
+        if input.KeyCode and input.KeyCode ~= Enum.KeyCode.Unknown then
+            return input.KeyCode
+        end
+
+        if input.UserInputType == Enum.UserInputType.Keyboard then
+            return nil
+        end
+
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+            or input.UserInputType == Enum.UserInputType.MouseButton2
+            or input.UserInputType == Enum.UserInputType.MouseButton3 then
+            return input.UserInputType
+        end
+
+        return nil
+    end
+
+trackConnection(safeConnect(UIS.InputBegan, function(input, gameProcessed)
+        if keybindCapture then
+            local capture = keybindCapture
+            if (os.clock() - (capture.startedAt or 0)) < 0.08 then
+                return
+            end
+            if input.KeyCode == Enum.KeyCode.Escape then
+                keybindCapture = nil
+                if capture.button then
+                    capture.button.Text = keyName(capture.option.Value)
+                end
+                return
+            end
+
+            local bind = extractBindableInput(input)
+            if bind then
+                keybindCapture = nil
+                capture.option:SetValue(bind)
+                if capture.button then
+                    capture.button.Text = keyName(capture.option.Value)
+                end
+            end
+            return
+        end
+
+        updateKeyStates(input, true)
+        if gameProcessed then
+            return
+        end
+        if keyMatch(input, MenuKey.Value) then
+            setMenuVisible(not menuState.open)
+        end
+    end))
+
+trackConnection(safeConnect(UIS.InputEnded, function(input)
+        updateKeyStates(input, false)
+    end))
+
+    Library:OnUnload(function()
+        for _, conn in ipairs(runtimeConnections) do
+            pcall(function()
+                conn:Disconnect()
+            end)
+        end
+        for _, conn in ipairs(keybindConnections) do
+            pcall(function()
+                conn:Disconnect()
+            end)
+        end
+        pcall(function()
+            if screen then
+                screen:Destroy()
+            end
+        end)
+        pcall(function()
+            if keybindScreen then
+                keybindScreen:Destroy()
+            end
+        end)
+    end)
+end
